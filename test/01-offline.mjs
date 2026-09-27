@@ -1,4 +1,5 @@
 // test/01-offline.mjs —— 不联网的纯函数检查
+import { createHmac } from 'node:crypto';
 import { check, summary } from './harness.mjs';
 import { md5, utf8Bytes } from '../lib/md5.mjs';
 import {
@@ -23,6 +24,12 @@ import {
     redactCookie,
     serializeCookieHeader,
 } from '../lib/bili-cookie.mjs';
+import { buildWebTicketUrl, createWbiSigner, deriveMixinKey, hmacSha256Hex } from '../lib/wbi.mjs';
+import {
+    artistCandidatesFromDescription,
+    artistCandidatesFromTitle,
+    extractArtistCandidates,
+} from '../lib/artist-candidates.mjs';
 
 console.log('\n== lib/md5.mjs：RFC 1321 标准测试向量 ==');
 check('md5("")', md5('') === 'd41d8cd98f00b204e9800998ecf8427e', md5(''));
@@ -147,5 +154,178 @@ check('空值脱敏为 none', redactCookie(new Map()) === 'none');
 
 const described = describeSession(fields);
 check('describeSession 报出登录态', described.loggedIn && described.userId === '99' && described.hasCsrf);
+
+console.log('\n== lib/wbi.mjs：两条密钥路径 ==');
+// 真实的一对 wbi 图像 URL。mixin key 是它们唯一确定的函数值，
+// 这里写死为回归值 —— 重排表或取值方式一变就会红。
+const WBI_IMG = 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png';
+const WBI_SUB = 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png';
+const EXPECTED_MIXIN_KEY = 'ea1db124af3c7062474693fa704f4ff8';
+
+const hmacMessage = 'ts1790481594';
+const webCryptoHmac = await hmacSha256Hex('XgwSnGZ1p', hmacMessage);
+// 用 Node 的 crypto 独立算一遍：两条实现一致才能说明 WebCrypto 那条没错
+const nodeHmac = createHmac('sha256', 'XgwSnGZ1p').update(hmacMessage).digest('hex');
+check('HMAC-SHA256 与 Node crypto 一致', webCryptoHmac === nodeHmac, String(webCryptoHmac));
+check('hexsign 是 64 位小写十六进制', /^[0-9a-f]{64}$/.test(webCryptoHmac ?? ''), String(webCryptoHmac));
+check('拿不到 crypto.subtle 时返回 null（不抛错、不返回垃圾）', (await hmacSha256Hex('XgwSnGZ1p', hmacMessage, {})) === null);
+check('subtle 抛错时也返回 null', (await hmacSha256Hex('k', 'm', { importKey: () => { throw new Error('nope'); } })) === null);
+
+const ticketUrl = buildWebTicketUrl(EXPECTED_MIXIN_KEY, 1790481594, 'csrf-token');
+check('ticket URL 指向 GenWebTicket', ticketUrl.startsWith('https://api.bilibili.com/bapis/bilibili.api.ticket.v1.Ticket/GenWebTicket?'));
+check('ticket URL 带 key_id=ec02', ticketUrl.includes('key_id=ec02'));
+check('ticket URL 的 context[ts] 被正确编码', ticketUrl.includes('context%5Bts%5D=1790481594'), ticketUrl);
+check('ticket URL 带 csrf（有 bili_jct 时）', ticketUrl.includes('csrf=csrf-token'));
+check('没有 bili_jct 时不带 csrf', !buildWebTicketUrl('x', 1).includes('csrf'));
+
+/** 造一个记录所有请求的假传输。 */
+const createTransport = ({ handler }) => {
+    const calls = [];
+    const getJson = async (url, init) => {
+        calls.push({ url, method: init?.method ?? 'GET', headers: init?.headers });
+        return handler(url, init);
+    };
+    return { calls, getJson };
+};
+
+const navPayload = { code: 0, data: { wbi_img: { img_url: WBI_IMG, sub_url: WBI_SUB } } };
+const ticketPayload = { code: 0, data: { nav: { img: WBI_IMG, sub: WBI_SUB } } };
+
+const navOnly = createTransport({ handler: async (url) => (url.includes('/nav') ? navPayload : null) });
+const navSigner = createWbiSigner(navOnly.getJson);
+const navSigned = await navSigner.sign('https://api.bilibili.com/x/player/pagelist', { bvid: 'BV1' });
+check('nav 路径能签名', navSigned.includes('w_rid='), navSigned.slice(0, 120));
+check('签名结果是合法的 URL', new URL(navSigned).searchParams.get('wts') !== null);
+check('mixin key 与独立算出的已知值一致', deriveMixinKey(WBI_IMG, WBI_SUB) === EXPECTED_MIXIN_KEY, deriveMixinKey(WBI_IMG, WBI_SUB));
+check('mixin key 长度 32', deriveMixinKey(WBI_IMG, WBI_SUB).length === 32);
+check('太短的 mixin url 抛错', (() => {
+    try {
+        deriveMixinKey('https://x/a.png', 'https://x/b.png');
+        return false;
+    } catch {
+        return true;
+    }
+})());
+check('密钥有缓存（第二次不重新拉 nav）', (() => {
+    const before = navOnly.calls.length;
+    return before === 1;
+})());
+
+// nav 返回了东西但形状不对（例如未登录时 data 里没有 wbi_img）→ 应当走 ticket
+const navBroken = createTransport({
+    handler: async (url, init) => (url.includes('/nav') ? { code: -3, data: {} } : url.includes('GenWebTicket') ? ticketPayload : null),
+});
+const warnings = [];
+const fallbackSigner = createWbiSigner(navBroken.getJson, { log: { warn: (m) => warnings.push(m), info: () => {} } });
+const fallbackSigned = await fallbackSigner.sign('https://api.bilibili.com/x/player/pagelist', { bvid: 'BV1' });
+check('nav 失败时改用 ticket', navBroken.calls.some((call) => call.url.includes('GenWebTicket')), navBroken.calls.map((c) => new URL(c.url).pathname).join(' → '));
+check('ticket 请求是 POST', navBroken.calls.find((call) => call.url.includes('GenWebTicket'))?.method === 'POST');
+check(
+    'ticket 请求用 Firefox UA（与普通接口不同）',
+    navBroken.calls.find((call) => call.url.includes('GenWebTicket'))?.headers?.['User-Agent']?.includes('Firefox/115.0'),
+    navBroken.calls.find((call) => call.url.includes('GenWebTicket'))?.headers?.['User-Agent'],
+);
+check('ticket 路径也能签名', fallbackSigned.includes('w_rid='));
+check('降级时有警告日志（不静默）', warnings.some((message) => message.includes('ticket')), warnings.join(' | '));
+// ticket 的 hexsign 必须由「秒级时间戳」算出，不是别的东西
+const ticketCall = navBroken.calls.find((call) => call.url.includes('GenWebTicket'));
+const ticketParams = new URL(ticketCall.url).searchParams;
+check('ticket 的 context[ts] 与 hexsign 对得上', (() => {
+    const ts = Number(ticketParams.get('context[ts]'));
+    if (!Number.isFinite(ts)) return false;
+    return ticketParams.get('hexsign') === createHmac('sha256', 'XgwSnGZ1p').update(`ts${ts}`).digest('hex');
+})(), ticketParams.get('hexsign'));
+
+// 有 bili_jct 时应当带上 csrf
+const withCsrf = createTransport({
+    handler: async (url) => (url.includes('/nav') ? null : ticketPayload),
+});
+await createWbiSigner(withCsrf.getJson, { getCsrf: () => 'csrf-abc' }).sign('https://api.bilibili.com/x/x', { a: '1' });
+check('有 bili_jct 时 ticket 带上 csrf', new URL(withCsrf.calls.find((c) => c.url.includes('GenWebTicket')).url).searchParams.get('csrf') === 'csrf-abc');
+
+// 环境没有 crypto.subtle 时的降级：必须给出可读的原因
+const noCrypto = createTransport({ handler: async (url) => (url.includes('/nav') ? null : ticketPayload) });
+const noCryptoWarnings = [];
+const noCryptoSigner = createWbiSigner(noCrypto.getJson, {
+    hmac: async () => null,
+    log: { warn: (m) => noCryptoWarnings.push(m), info: () => {} },
+});
+try {
+    await noCryptoSigner.sign('https://api.bilibili.com/x/x', { a: '1' });
+    check('没有 crypto.subtle 时抛错', false, '没有抛错');
+} catch (error) {
+    check('没有 crypto.subtle 时抛错并指明原因', String(error.message).includes('crypto.subtle'), String(error.message));
+}
+check('缺少 crypto.subtle 会打警告（不静默失败）', noCryptoWarnings.some((m) => m.includes('crypto.subtle')), noCryptoWarnings.join(' | '));
+
+// 两条都失败：错误里要同时给出两条的原因
+const bothFail = createTransport({ handler: async () => null });
+try {
+    await createWbiSigner(bothFail.getJson, { hmac: async () => null }).sign('https://api.bilibili.com/x/x', {});
+    check('两条路径都失败时抛错', false, '没有抛错');
+} catch (error) {
+    check('两条路径都失败时抛错，且原因里两条都在', String(error.message).includes('nav:') && String(error.message).includes('ticket'), String(error.message));
+}
+
+// 签名本身：参数排序、filterValue、w_rid
+const signParams = createTransport({ handler: async () => navPayload });
+const signer = createWbiSigner(signParams.getJson);
+const signedUrl = new URL(await signer.sign('https://api.bilibili.com/x/x', { b: '2', a: "1!'()*3" }));
+check('参数值里的 !\'()* 被去掉', signedUrl.searchParams.get('a') === '13', signedUrl.searchParams.get('a'));
+check('带上 w_rid', (signedUrl.searchParams.get('w_rid') ?? '').length === 32);
+
+console.log('\n== lib/artist-candidates.mjs：从标题/简介提艺术家 ==');
+// 下面每一条标题都是实测的 B 站搜索结果原文
+const artistCases = [
+    ['YOASOBI 夜に駆ける (Yoru ni Kakeru) Official Music Video', 'Ayase-YOASOBI', '', ['YOASOBI']],
+    ['[Hi-Res 48kHz/24bit][中字]YOASOBI - 夜に駆ける', '云妮洁', '', ['YOASOBI']],
+    ['【布茸｜手书】夜に駆ける', '来吧马猴', '', ['来吧马猴']],
+    ['【4K60无损】高桥洋子 残酷天使的行动纲领 中日字幕配罗马音 残酷な天使のテーゼ 新世纪福音战士 EVA', '4K音楽館', '', ['高桥洋子']],
+    ['【4K顶级画质】高桥洋子《残酷な天使のテーゼ》万人现场，最经典的OP神曲！！！', '蚕豆音乐侠', '', ['高桥洋子']],
+    ['YOASOBI - IDOL', 'Browin_Bear', '', ['YOASOBI']],
+    ['【𝐇𝐢-𝐑𝐞𝐬无损音质】｜《晴天》- 周杰伦 -‘故事的小黄花’', 'VV音乐局', '', ['周杰伦']],
+    ['【4K修复】周杰伦 - 晴天MV 2160P修复版', 'zyl2012_音乐无限', '', ['周杰伦']],
+    ['周杰伦 - 晴天', '怪束黍', '', ['周杰伦']],
+    ['【4K Hi-Res】晴天-周杰伦', '如歌如梦', '', ['周杰伦']],
+];
+for (const [title, owner, desc, expected] of artistCases) {
+    const candidates = extractArtistCandidates({ title, ownerName: owner, desc });
+    check(
+        `「${title.slice(0, 24)}…」提出 ${expected.join('/')}`,
+        expected.every((name) => candidates.includes(name)),
+        JSON.stringify(candidates),
+    );
+}
+check('找不到线索时退回 UP 主', JSON.stringify(extractArtistCandidates({ title: '残酷天使的恐怖纲领', ownerName: '屎急少女' })) === '["屎急少女"]');
+check('无任何线索时返回空数组', extractArtistCandidates({}).length === 0);
+check('去重（同一个名字不会出现两次）', (() => {
+    const candidates = extractArtistCandidates({ title: 'YOASOBI - Song', ownerName: 'YOASOBI' });
+    return candidates.filter((name) => name === 'YOASOBI').length === 1;
+})());
+check('候选数量有上限', extractArtistCandidates({ title: 'A - B / C/ D/ E/ F/ G/ H/ I/ J', ownerName: 'K' }).length <= 8);
+check('带句子标点的片段被丢弃', extractArtistCandidates({ title: '【4K顶级画质】高桥洋子《残酷な天使のテーゼ》万人现场，最经典的OP神曲！！！' }).every((name) => !/[，。！？]/.test(name)));
+check('url 与长数字被丢弃', !extractArtistCandidates({ desc: '歌手：http://example.com/12345' }).some((name) => name.includes('http')));
+check('staff 名字排在前面', extractArtistCandidates({ title: 'Song - Artist', staff: [{ name: '署名的人' }] })[0] === '署名的人');
+check('简介里的「歌手：」优先于标题', (() => {
+    const candidates = extractArtistCandidates({ title: 'A - B', desc: '歌手：真正的人\n作词：另一个人' });
+    return candidates.indexOf('真正的人') < candidates.indexOf('A');
+})());
+check('简介里的「主唱：x / y」会拆开', (() => {
+    const candidates = artistCandidatesFromDescription('主唱：ikura/幾田りら');
+    return candidates.includes('ikura') && candidates.includes('幾田りら');
+})());
+check('纯空白的标题不炸', artistCandidatesFromTitle('').length === 0 && artistCandidatesFromTitle(null).length === 0);
+check('纯空白的简介不炸', artistCandidatesFromDescription('   ').length === 0);
+check(
+    '实心连字符的短名字也拆得开（「晴天-周杰伦」）',
+    (() => {
+        const candidates = artistCandidatesFromTitle('【4K Hi-Res】晴天-周杰伦');
+        return candidates.includes('晴天') && candidates.includes('周杰伦');
+    })(),
+);
+check('「Ayase-YOASOBI」两边都留下', (() => {
+    const candidates = artistCandidatesFromTitle('Ayase-YOASOBI');
+    return candidates.includes('Ayase') && candidates.includes('YOASOBI');
+})());
 
 process.exit(summary() === 0 ? 0 : 1);
