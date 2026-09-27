@@ -12,6 +12,7 @@ import { createWbiSigner } from '../lib/wbi.mjs';
 const API_ROOT = 'https://api.bilibili.com';
 const SEARCH_URL = `${API_ROOT}/x/web-interface/wbi/search/type`;
 const VIEW_URL = `${API_ROOT}/x/web-interface/wbi/view`;
+const PAGELIST_URL = `${API_ROOT}/x/player/pagelist`;
 const PLAY_URL = `${API_ROOT}/x/player/wbi/playurl`;
 
 /** 与原实现同款 Web UA：接口对 UA 敏感，别改。 */
@@ -88,15 +89,15 @@ const parseSongId = (id) => {
  */
 export const createBilibiliProvider = ({ http, lrclib, log }) => {
     const wbi = createWbiSigner((url) => http.json(url, { headers: HEADERS }));
-    /** bvid → cid。搜索接口不返回 cid，取流时补。 */
-    const cidCache = new Map();
+    /** bvid → { cid, durationMs, partName }。搜索接口不返回 cid，取流时补。 */
+    const partCache = new Map();
 
-    const rememberCid = (bvid, cid) => {
-        if (cidCache.size >= CID_CACHE_LIMIT) {
-            const oldest = cidCache.keys().next().value;
-            if (oldest !== undefined) cidCache.delete(oldest);
+    const rememberPart = (bvid, part) => {
+        if (partCache.size >= CID_CACHE_LIMIT) {
+            const oldest = partCache.keys().next().value;
+            if (oldest !== undefined) partCache.delete(oldest);
         }
-        cidCache.set(bvid, cid);
+        partCache.set(bvid, part);
     };
 
     const signedGet = async (base, params) => {
@@ -112,20 +113,40 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
         return http.json(url, { headers: HEADERS });
     };
 
-    /** 取视频首个分 P 的 cid 与分 P 列表。 */
-    const resolveCid = async (bvid) => {
-        const cached = cidCache.get(bvid);
+    /**
+     * 取视频的分 P 列表。用 /x/player/pagelist 而不是 /x/web-interface/wbi/view：
+     * 前者不要求 WBI 签名、不要求 cookie，实测最稳；后者在实测网络里对正确的 bvid
+     * 和 aid 都返回 code -404，而同一个 bvid 在 pagelist 里能正常拿到 cid。
+     *
+     * @returns {Promise<{ cid: number, partName: string, durationMs: number } | null>}
+     */
+    const fetchFirstPart = async (bvid) => {
+        const cached = partCache.get(bvid);
         if (cached) return cached;
-        const payload = await signedGet(VIEW_URL, { bvid });
-        if (payload?.code !== 0) {
-            log?.info?.('bili view failed', { bvid, code: payload?.code });
+
+        const payload = await signedGet(PAGELIST_URL, { bvid });
+        if (payload?.code !== 0 || !Array.isArray(payload?.data) || payload.data.length === 0) {
+            log?.info?.('bili pagelist failed', { bvid, code: payload?.code, message: payload?.message });
             return null;
         }
-        const pages = payload?.data?.pages;
-        const cid = Number(payload?.data?.cid) || Number(Array.isArray(pages) ? pages[0]?.cid : 0);
+
+        const first = payload.data[0];
+        const cid = Number(first?.cid);
         if (!Number.isFinite(cid) || cid <= 0) return null;
-        rememberCid(bvid, cid);
-        return cid;
+
+        const part = {
+            cid,
+            partName: typeof first?.part === 'string' ? first.part : '',
+            durationMs: Number(first?.duration) > 0 ? Number(first.duration) * 1000 : 0,
+        };
+        rememberPart(bvid, part);
+        return part;
+    };
+
+    /** 只有在 pagelist 拿不到时才退到 view；它可能带更完整的元数据，但要求更苛刻。 */
+    const fetchView = async (bvid) => {
+        const payload = await signedGet(VIEW_URL, { bvid });
+        return payload?.code === 0 ? (payload.data ?? null) : null;
     };
 
     /** 在候选流里按档位挑一条。优先取不超过请求档位的最高档。 */
@@ -195,17 +216,24 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
         async getSong(id) {
             const { bvid, cid } = parseSongId(id);
             if (!bvid) return null;
-            const resolvedCid = cid ?? (await resolveCid(bvid));
+
+            const part = await fetchFirstPart(bvid);
+            const resolvedCid = cid ?? part?.cid;
             if (!resolvedCid) return null;
-            const payload = await signedGet(VIEW_URL, { bvid });
-            if (payload?.code !== 0) return null;
-            const data = payload?.data ?? {};
+
+            // view 能给出真正的标题与封面；拿不到就退回分 P 名（对 MV 来说通常就是曲名）
+            const view = await fetchView(bvid);
+            const title = view?.title || part?.partName || bvid;
+            const owner = view?.owner?.name;
+
             return {
                 id: makeSongId(bvid, resolvedCid),
-                title: data.title || bvid,
-                artists: data.owner?.name ? [data.owner.name] : [],
-                coverUrl: ensureHttps(data.pic),
-                durationMs: Number(data.duration) > 0 ? Number(data.duration) * 1000 : undefined,
+                title: String(title).trim() || bvid,
+                artists: owner ? [owner] : [],
+                coverUrl: ensureHttps(view?.pic),
+                durationMs: part?.durationMs > 0
+                    ? part.durationMs
+                    : Number(view?.duration) > 0 ? Number(view.duration) * 1000 : undefined,
             };
         },
 
@@ -213,7 +241,7 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
             const { bvid, cid } = parseSongId(song?.id);
             if (!bvid) return null;
 
-            const resolvedCid = cid ?? (await resolveCid(bvid));
+            const resolvedCid = cid ?? (await fetchFirstPart(bvid))?.cid;
             if (!resolvedCid) {
                 log?.warn?.('bili cid unresolved', { bvid });
                 return null;
@@ -222,7 +250,7 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
             const payload = await signedGet(PLAY_URL, {
                 bvid,
                 cid: String(resolvedCid),
-                // fnval=16 要 DASH（只有 DASH 才给纯音频流）；四个常量都不要改
+                // fnval=16 要 DASH（只有 DASH 才给纯音频流）；这几个常量都不要改
                 fnval: '16',
                 fnver: '0',
                 fourk: '1',
@@ -250,7 +278,14 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
             const title = cleanTrackName(song?.title ?? '');
             const artist = (Array.isArray(song?.artists) ? song.artists[0] : '') ?? '';
             try {
-                const found = await lrclib.lookup({ title, artist, durationMs: Number(song?.durationMs) || 0 });
+                // relaxedDuration：B 站是视频源，时长天然长于录音室版本（MV 常有前奏/尾奏），
+                // 拿严格时长去卡会大面积漏掉。宽松模式下时长只用于排序，不用于淘汰。
+                const found = await lrclib.lookup({
+                    title,
+                    artist,
+                    durationMs: Number(song?.durationMs) || 0,
+                    relaxedDuration: true,
+                });
                 return found ? { lrc: found.lrc } : null;
             } catch (error) {
                 log?.warn?.('lyric lookup failed', { message: String(error?.message ?? error) });

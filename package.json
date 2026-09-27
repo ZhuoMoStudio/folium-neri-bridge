@@ -1,0 +1,16 @@
+{
+  "name": "folium-neri-bridge",
+  "version": "0.1.1",
+  "private": true,
+  "description": "把 Android 端 NeriPlayer 的音源与歌词源接入 Folia 的 Folium 模组平台",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "test": "node test/01-offline.mjs && node test/03-contract.mjs",
+    "test:offline": "node test/01-offline.mjs",
+    "test:contract": "node test/03-contract.mjs",
+    "test:live": "node test/02-live.mjs",
+    "test:cdn": "node test/04-cdn.mjs",
+    "test:all": "npm run test && npm run test:live && npm run test:cdn"
+  }
+}
