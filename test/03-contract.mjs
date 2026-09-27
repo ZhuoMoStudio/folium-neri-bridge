@@ -1,6 +1,9 @@
 // test/03-contract.mjs —— 用上游自己的代码校验契约，而不是靠人读文档
 //
 // 需要 Folia 源码可读：FOLIA_SRC=/path/to/folia-major-main
+//
+// 第 6–8 节把打桩宿主补上了实验接口与设置分区的 params，
+// 于是「钩子按正确的名字注册」与「设置开关真的控制 provider 注册」也能在这里验。
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +34,7 @@ if (validateManifest) {
         console.log('    归一化后的清单:', JSON.stringify(result.value));
         check('permissions 被上游接受', JSON.stringify(result.value.permissions) === '["net.fetch","filesystem.data"]');
         check('experimental 含 omni.providers', result.value.experimental.includes('omni.providers'));
+        check('experimental 含 omni.hooks（逐字歌词要用）', result.value.experimental.includes('omni.hooks'), JSON.stringify(result.value.experimental));
         check('main 被识别为 index.cjs', result.value.main === 'index.cjs');
         check('client 被识别为 client.mjs', result.value.client === 'client.mjs');
     }
@@ -131,29 +135,53 @@ console.log('\n== 4. client.mjs：用打桩宿主端到端跑一遍 ==');
 const { default: activate } = await import('../client.mjs');
 const { createFakeFolium } = await import('./harness.mjs');
 
-/** 打一个只记录注册调用的宿主。形状对齐 api.md 里的 FoliumRegistries。 */
-const createStubHost = () => {
+/** 打一个只记录注册调用的宿主。形状对齐 api.md 里的 FoliumRegistries 与实验接口。 */
+const createStubHost = ({ settings = {}, withHooks = true } = {}) => {
     const { folium } = createFakeFolium();
-    const state = { provider: null, section: null, commands: [], unregistered: [], calls: [] };
+    const state = {
+        providers: [],
+        sections: [],
+        commands: [],
+        unregistered: [],
+        hooks: new Map(),
+        calls: [],
+    };
     folium.storage = {
         get: async (key) => state.calls.push(['storage.get', key]) && undefined,
         set: async (key) => state.calls.push(['storage.set', key]),
     };
     folium.ui = { toast: (message) => state.calls.push(['toast', message]) };
     folium.rpc = { call: async (name, ...args) => (state.calls.push(['rpc', name, ...args]), { ok: true, loggedIn: false }) };
+    // 设置分区注册后能读到默认值合并过的 params（宿主契约如此）
+    const paramsOf = (def) =>
+        Object.fromEntries((def.settings ?? []).map((entry) => [entry.key, settings[entry.key] ?? entry.defaultValue]));
     folium.experimental = {
         'omni.providers': Object.freeze({
             register: (def) => {
-                state.provider = def;
-                return { id: `neri-bridge:${def.id}`, unregister: () => state.unregistered.push('provider') };
+                state.providers.push(def);
+                return { id: `neri-bridge:${def.id}`, unregister: () => state.unregistered.push(`provider:${def.id}`) };
             },
         }),
+        ...(withHooks
+            ? {
+                'omni.hooks': Object.freeze({
+                    on: (type, handler, options) => {
+                        state.hooks.set(type, { handler, options });
+                        return () => state.hooks.delete(type);
+                    },
+                }),
+            }
+            : {}),
     };
     folium.registries = {
         settingsSections: {
             register: (def) => {
-                state.section = def;
-                return { id: `neri-bridge:${def.id}`, unregister: () => state.unregistered.push('section') };
+                state.sections.push(def);
+                return {
+                    id: `neri-bridge:${def.id}`,
+                    params: { get: () => paramsOf(def) },
+                    unregister: () => state.unregistered.push(`section:${def.id}`),
+                };
             },
         },
         commands: {
@@ -168,7 +196,7 @@ const createStubHost = () => {
 
 const host = createStubHost();
 const dispose = activate(host.folium);
-const provider = host.state.provider;
+const provider = host.state.providers.find((def) => def.id === 'bilibili');
 
 check('activate 注册了 provider', Boolean(provider));
 check('provider.id 为 bilibili', provider?.id === 'bilibili', provider?.id);
@@ -177,11 +205,17 @@ check('provider 实现了 search / getSong / getAudioUrl / getLyrics',
     typeof provider?.getAudioUrl === 'function' && typeof provider?.getLyrics === 'function');
 check('注册通过 omniProvidersRegistry 的第一道校验（至少实现一个方法）', Boolean(provider?.search || provider?.getAudioUrl || provider?.getLyrics));
 
-check('注册了设置分区', Boolean(host.state.section), host.state.section?.id);
-check('设置分区的 settings 是数组（契约要求必填）', Array.isArray(host.state.section?.settings), JSON.stringify(host.state.section?.settings?.map((p) => p.key)));
-check('设置分区声明了 settingsPanel', typeof host.state.section?.settingsPanel === 'function');
-check('每个 setting 都有 key/type/label', (host.state.section?.settings ?? []).every((p) =>
-    typeof p.key === 'string' && ['number', 'text', 'boolean', 'select'].includes(p.type) && p.label));
+check('注册了设置分区', host.state.sections.length > 0, host.state.sections.map((section) => section.id).join(','));
+check('设置分区的 settings 是数组（契约要求必填）', host.state.sections.every((section) => Array.isArray(section.settings)), JSON.stringify(host.state.sections.map((s) => s.settings?.map((p) => p.key))));
+check('设置分区声明了 settingsPanel', host.state.sections.some((section) => typeof section.settingsPanel === 'function'));
+check('每个 setting 都有 key/type/label', host.state.sections.every((section) => (section.settings ?? []).every((p) =>
+    typeof p.key === 'string' && ['number', 'text', 'boolean', 'select'].includes(p.type) && p.label)));
+check('Bilibili 登录分区仍在', host.state.sections.some((section) => section.id === 'bilibili-login'));
+check(
+    '音源分区带 YouTube 开关（默认关闭）',
+    host.state.sections.find((section) => section.id === 'sources')?.settings?.some((p) => p.key === 'enableYoutube' && p.defaultValue === false),
+    JSON.stringify(host.state.sections.find((section) => section.id === 'sources')?.settings?.map((p) => [p.key, p.defaultValue])),
+);
 
 check('注册了命令', host.state.commands.length > 0, host.state.commands.map((c) => c.id).join(','));
 check('每个命令有 id/label/run', host.state.commands.every((c) =>
@@ -192,7 +226,7 @@ check('activate 返回 disposer', typeof dispose === 'function');
 if (typeof dispose === 'function') {
     dispose();
     check('disposer 撤下了 provider 与设置分区',
-        host.state.unregistered.includes('provider') && host.state.unregistered.includes('section'),
+        host.state.unregistered.includes('provider:bilibili') && host.state.unregistered.some((entry) => entry.startsWith('section:')),
         JSON.stringify(host.state.unregistered));
     check('disposer 撤下了所有命令',
         host.state.commands.every((c) => host.state.unregistered.includes(`command:${c.id}`)),
@@ -217,5 +251,80 @@ bare.folium.log = { info: () => {}, warn: () => {}, error: (m) => { bareError = 
 const bareResult = activate(bare.folium);
 check('没有 experimental 时返回 undefined', bareResult === undefined);
 check('并写了一条 error 日志', typeof bareError === 'string' && bareError.includes('omni.providers'), String(bareError));
+
+console.log('\n== 6. omni.hooks：逐字歌词的钩子 ==');
+const hookHost = createStubHost();
+const hookDispose = activate(hookHost.folium);
+check('注册了 lyricsResolved 钩子', hookHost.state.hooks.has('lyricsResolved'), [...hookHost.state.hooks.keys()].join(','));
+check('钩子的类型名恰好是合约里的那个', [...hookHost.state.hooks.keys()].every((type) => type === 'lyricsResolved'));
+
+const hook = hookHost.state.hooks.get('lyricsResolved')?.handler;
+const makeEvent = (song, lines) => ({ song, lines, isPureMusic: false });
+
+// 别人的歌：一个字都不能改
+const foreign = makeEvent({ id: 'local:1', source: 'local', title: '本地歌', artist: 'x' }, [{ startTime: 1, endTime: 2, fullText: 'a' }]);
+const foreignBefore = foreign.lines;
+await hook(foreign);
+check('非本模组的歌不动（本地源）', foreign.lines === foreignBefore);
+const otherOnline = makeEvent({ id: 'netease:1', source: 'netease', title: '在线歌', artist: 'y' }, [{ startTime: 1, endTime: 2, fullText: 'a' }]);
+const otherOnlineBefore = otherOnline.lines;
+await hook(otherOnline);
+check('非本模组的歌不动（内置在线源）', otherOnline.lines === otherOnlineBefore);
+
+// 本模组但还没预备过逐字：保持原样，不抛错
+const ours = makeEvent(
+    { id: 'bili:BV1xxxxxxxxx:1', source: 'folium.neri-bridge.bilibili', title: '夜に駆ける', artist: 'YOASOBI' },
+    [{ startTime: 1, endTime: 2, fullText: '沈むように' }],
+);
+const oursBefore = ours.lines;
+await hook(ours);
+check('没有预备过逐字时保持原样（不抛错）', ours.lines === oursBefore);
+
+// 钩子必须对 event 的缺字段容错 —— 宿主契约如此，但模组不该因此崩掉
+let hookThrew = null;
+try {
+    await hook({ song: undefined, lines: undefined });
+} catch (error) {
+    hookThrew = error;
+}
+check('缺 song / lines 时不抛错', hookThrew === null, String(hookThrew));
+
+if (typeof hookDispose === 'function') {
+    check('activate 返回的 disposer 能撤下钩子', (() => {
+        hookDispose();
+        return true;
+    })());
+}
+
+console.log('\n== 7. 缺 omni.hooks 时逐字歌词降级，但 LRC 回退不受影响 ==');
+const noHookHost = createStubHost({ withHooks: false });
+const noHookWarnings = [];
+noHookHost.folium.log = {
+    info: () => {},
+    warn: (message) => noHookWarnings.push(String(message)),
+    error: () => {},
+};
+const noHookDispose = activate(noHookHost.folium);
+check('没有 omni.hooks 时仍注册了 provider', noHookHost.state.providers.some((def) => def.id === 'bilibili'));
+check('没有 omni.hooks 时仍注册了设置分区', noHookHost.state.sections.length > 0);
+check('并写了一条可读的降级警告', noHookWarnings.some((message) => message.includes('omni.hooks')), noHookWarnings.join(' | '));
+check('降级时歌词能力仍在（getLyrics 在 provider 上）', typeof noHookHost.state.providers.find((def) => def.id === 'bilibili')?.getLyrics === 'function');
+if (typeof noHookDispose === 'function') noHookDispose();
+
+console.log('\n== 8. YouTube provider 由设置开关控制 ==');
+const offHost = createStubHost({ settings: { enableYoutube: false } });
+activate(offHost.folium);
+check('开关关闭时不注册 YouTube provider', !offHost.state.providers.some((def) => def.id === 'youtube'), offHost.state.providers.map((def) => def.id).join(','));
+
+const onHost = createStubHost({ settings: { enableYoutube: true } });
+activate(onHost.folium);
+const youtube = onHost.state.providers.find((def) => def.id === 'youtube');
+check('开关打开时注册 YouTube provider', Boolean(youtube));
+check('YouTube provider 只声明 search / getSong / getLyrics', Boolean(youtube?.search && youtube?.getSong && youtube?.getLyrics));
+check(
+    'YouTube provider **没有** getAudioUrl（匿名播放拿不到地址，不假装能放）',
+    youtube?.getAudioUrl === undefined,
+    String(typeof youtube?.getAudioUrl),
+);
 
 process.exit(summary() === 0 ? 0 : 1);
