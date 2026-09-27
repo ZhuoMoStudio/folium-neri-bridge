@@ -2,16 +2,17 @@
 
 把 [NeriPlayer](https://github.com/cwuom/NeriPlayer) 的 B 站音源接进 [Folia](https://github.com/chthollyphile/folia-major)。跑在 Folium 模组平台上，**只在桌面版可用**（网页版没有模组系统）。
 
-上游议题：[chthollyphile/folia-major#440](https://github.com/chthollyphile/folia-major/issues/440)（逐字歌词透传，模组侧暂时拿不到）
+上游议题：[chthollyphile/folia-major#440](https://github.com/chthollyphile/folia-major/issues/440)（逐字歌词透传。**本模组不等它** —— 走 `omni.hooks` 自己装，见下）
 
 ## 能力
 
 | 项 | 说明 |
 | --- | --- |
-| 搜索 | B 站视频搜索，WBI 签名 |
+| 搜索 | B 站视频搜索，WBI 签名。密钥两条路径：`nav`，失败时退到 `GenWebTicket` |
 | 播放 | DASH 纯音频流，按档位挑流，带过期时间 |
-| 歌词 | LRCLIB 回退。只返回带时间戳的歌词 |
+| 歌词 | 行级走 LRCLIB；**逐字**走 AMLL TTDB（syllable 级，含翻译 / 音译 / 背景人声） |
 | 登录 | 网页窗口 / 扫码 / 粘贴 Cookie 三种，登录态存本机 |
+| YouTube Music | 搜索与元数据，**默认关闭**。播放不可用，原因见下 |
 
 未登录也能搜和放，但 B 站会压低音质、会员内容拿不到。
 
@@ -25,24 +26,53 @@ npm install && npm run dev:electron
 
 设置 → 实验室 → 模组系统 开启总开关，然后在模组面板里启用本模组并确认。
 
-## 测
+## 逐字歌词
 
-```bash
-npm test            # 离线：纯函数 + 契约，不联网
-npm run test:live   # 真实 B 站搜索 / 取流 / LRCLIB
-npm run test:cdn    # 采样两个 CDN，验防盗链策略
-npm run test:login  # 扫码登录链路
+`omni.providers` 的 `getLyrics` 只能返回 `{ lrc, translationLrc }`，逐字时轴没有地方放。本模组从侧门进去：宿主在歌词到达播放器前会派发 `omni.lyricsResolved`，钩子可以**整体替换** `lines`，而 `FoliumLine.words[].syllables[]` 正是逐字高亮读的东西。
+
+链路分两半，中间靠一个内存中继传递，原因是一个硬约束：
+
+```
+provider.getLyrics  ──联网取 TTML + 对齐──▶  relay  ──纯内存取用──▶  omni.lyricsResolved 钩子
+   没有时间预算                                     每个处理器只有 1500ms
 ```
 
-从干净克隆跑过：54 + 17 + 66 + 17 + 10 = **164 项，0 失败**（Node 22.14，2026-09-27）。
+`src/mods/folium/events.ts` 的 `ASYNC_TIMEOUT_MS = 1500`：钩子里的 `await` 一旦超时，宿主就不再等，对 `event.lines` 的赋值也不再生效。所以**联网必须发生在 `getLyrics` 里**（那条路径没有预算限制），钩子只做一次内存查表加一次纯函数判断。
 
-`03-contract` 不是自己写断言，是加载 folia-major 的 `manifest.cjs` 和打桩宿主，直接跑上游代码。
+歌词源用 [AMLL TTDB](https://github.com/amll-dev/amll-ttml-db)（**CC0-1.0**，公有领域奉献）。它的在线服务只按 `[平台]/[音乐ID]` 取歌词，**没有搜索接口**，而 B 站的歌没有 ncm/qq/am/spotify 的 id。所以流程是：拉 `metadata/raw-lyrics-index.jsonl`（1.6MB，gzip 传输约 428KB）→ 压成紧凑形状落到模组数据文件（实测 453KB / 3080 条，占 1MB 上限的 44%）→ 本地按标题/艺术家匹配 → 拿到 id 或文件名再取 TTML。
 
-## 踩过的三个坑
+装上去之前要过三道门：
 
-都写进对应文件的注释了，这里只留结论：
+1. **标题**：必须「相等 / 前缀 / 互相包含」（`scoreLyricMatchTitle` ≥ 52）；
+2. **艺术家**：必须命中（`scoreLyricMatchArtist` ≥ 24）。B 站搜索只给 UP 主名，所以 `lib/artist-candidates.mjs` 会从标题、简介、合作者名单里再提一批候选；
+3. **对齐**：TTML 按母带对齐，而 B 站是视频源，常有前奏/尾奏差。拿宿主已经解析好的行级时轴当参照求一个常量偏移，取中位数。**对不齐就不装** —— 实测「残酷な天使のテーゼ」在 TTDB 里只有 Ambivalence Mix，和视频版对不上，硬套只会让逐字高亮整体错位。
 
-**1. `/x/web-interface/wbi/view` 拿不到 cid。** 对正确的 bvid 和 aid 都返回 `code: -404`，同一个 bvid 在 `/x/player/pagelist` 上正常。已改用 pagelist。
+没有参照时轴可对（LRCLIB 也没这份歌）时，只认「标题完全相等」这一档：没有东西能证明版本一致，就别硬装。
+
+## YouTube Music
+
+**搜索可用，播放不可用。** 这不是省事，是实测结论（2026-09-27，直连）：
+
+| 端点 / 客户端 | 结果 |
+| --- | --- |
+| `youtubei/v1/search`（WEB_REMIX） | ✅ 匿名可用，20 条结果，标题/艺术家/专辑/时长齐全，翻页令牌也能用 |
+| `youtubei/v1/player` WEB_REMIX（首页下发的最新 clientVersion） | ❌ `UNPLAYABLE / Video unavailable`，0 个音频格式 |
+| 同上 WEB（`2.20260925.01.00`） | ❌ 同上 |
+| `ANDROID_VR` 1.62.27 / 1.60.19 | ❌ `LOGIN_REQUIRED / Sign in to confirm you're not a bot` |
+| `TVHTML5` / `TVHTML5_SIMPLY_EMBEDDED_PLAYER` | ❌ `LOGIN_REQUIRED`（后者：YouTube is no longer supported…） |
+| `MWEB` | ❌ `UNPLAYABLE / The page needs to be reloaded.` |
+
+请求本身没问题：`videoDetails` 正常返回，同一个 videoId 的 oEmbed 也是 200（「夜に駆ける」，YOASOBI - Topic，261s）。缺的只有 `streamingData`，也就是 PO Token / BotGuard 那一关。而 PO Token 要跑 Google 的混淆 VM（yt-dlp 得外挂 bgutil 之类的 sidecar），在模组里做既不可靠，也违背本仓库「不下载执行远程代码」这条自我约束。
+
+所以 `providers/youtube.mjs` **不声明 `getAudioUrl`**，能力表里 `playback` 就是 false，宿主不会把它当可播放源；同时它默认关闭（设置 → 音源 → 「启用 YouTube Music 搜索」），一个放不了的音源出现在选择器里只会让人以为坏了。
+
+`test/09-youtube.mjs` 里有一条**金丝雀**：它断言「仍然拿不到匿名播放地址」。哪天它红了，说明 YouTube 放开了，那时应该回来把 `getAudioUrl` 实现掉。看到它红请先看那条测试的注释。
+
+## 踩过的坑
+
+结论写在这里，过程写在对应文件的注释里。
+
+**1. `/x/web-interface/wbi/view` 不是可靠的 cid 来源。** 实测 `BV1Ph411C7S5`（YOASOBI 的夜に駆ける MV）对**正确的** bvid 和 aid 都返回 `code: -404`，同一个 bvid 在 `/x/player/pagelist` 上完全正常。所以 cid 一律走 pagelist。`view` 仍然有用（标题、封面、简介、合作者名单），但失败要缓存 —— 不缓存的话 `getSong` / `getLyrics` / 艺术家候选三条路会各问一次同一个 -404。
 
 **2. B 站有两个 CDN 家族，防盗链策略不一样。**
 
@@ -53,9 +83,29 @@ npm run test:login  # 扫码登录链路
 
 Folia 的页面来源两种都撞 403（开发 `localhost:3000`、生产 `file://`），而 `<audio>` 没法自定义请求头。所以 `index.cjs` 把 Referer 一律改写成 B 站的值。
 
-只测一个节点会得出「不带 Referer 也行」的错误结论 —— 我第一版就是这么写错的。`test/04-cdn.mjs` 专门用来复现这件事。
+只测一个节点会得出「不带 Referer 也行」的错误结论 —— 第一版就是这么写错的。`test/04-cdn.mjs` 专门用来复现这件事。
 
 **3. 纯文本歌词交出去等于没有歌词。** `parseLRC` 会丢无时间标签的行（`parserCore.ts:347`），所以拿不到同步歌词时返回 `null`，不返回纯文本。
+
+**4. 宿主给钩子的预算是 1.5 秒。** 见「逐字歌词」一节。第一版把联网放在钩子里，代码看起来对，实际上是死路 —— 超时后宿主直接放弃等待，`event.lines` 的赋值没人看。
+
+**5. `words` 拼接必须等于 `fullText`。** 这不是我们的约定，是宿主的：`enhancedLrcSerializer.ts` 的 `alignWordSegments` 用这条不变量判断要不要自己去 `fullText` 里找词。所以 TTML 里「写在下个 span 开头的空格」要折算到上一个 syllable 的尾部，行末空格要去掉。实测 Idol 的 91 行里就有 1 行以空格结尾，差这一个字符就会让宿主白跑一遍重新对齐。
+
+## 测
+
+```bash
+npm test              # 离线：纯函数 + 契约 + 匹配评分 + 逐字歌词，不联网
+npm run test:live     # 真实 B 站搜索 / 取流 / LRCLIB / WBI ticket 兜底
+npm run test:cdn      # 采样两个 CDN，验防盗链策略
+npm run test:login    # 扫码登录链路
+npm run test:amll     # 真实 AMLL TTDB：索引 → 匹配 → TTML → 对齐
+npm run test:youtube  # 真实 InnerTube：搜索可用 + 播放不可用的金丝雀
+npm run test:all      # 全部
+```
+
+`03-contract` 不是自己写断言，是加载 folia-major 的 `manifest.cjs` 和打桩宿主，直接跑上游代码。
+
+`08-amll-live` 与 `09-youtube` 依赖上游可用性（raw.githubusercontent / amll-ttml-db.stevexmh.net / music.youtube.com），它们红了先看是不是上游的事。
 
 ## 登录
 
@@ -71,11 +121,11 @@ Folia 的页面来源两种都撞 403（开发 `localhost:3000`、生产 `file:/
 
 ## 已知限制
 
-- **逐字歌词拿不到。** Folium 的 mod provider 能力硬编码在 `omniProviders.ts:62` 的 `wordByWordLyrics: false`，`getLyrics` 只收 `{ lrc, translationLrc }`。等 #440 落地。附带影响：`chorusResolver.ts:54` 读 `wordByWordText` 判副歌，所以模组音源的歌也拿不到副歌识别。
-- **WBI 只有一条密钥路径。** 原实现还有 `GenWebTicket` 兜底，本模组没做。
-- **歌词匹配是简化版。** NeriPlayer 的完整策略是约 480 行评分制（`EditableLyricMatchPolicy.kt`），这里只做了归一化相等 + 艺术家包含。误匹配率会高一些。
-- **B 站歌名的艺术家很弱。** 搜索只给 UP 主名，LRCLIB 的艺术家判定会打折。
-- **还没在真的 Folia 里跑过。** 契约层验过（上游校验器 + 打桩宿主），但 `webRequest` 的实际行为和 `<audio>` 播放要在装了 Folia 的机器上确认。
+- **逐字歌词取决于 TTDB 的覆盖。** 库里有 3000 多首（人工审核过的投稿），没有的歌就只有行级 LRC。这是数据问题，不是实现问题。
+- **逐字歌词走的是实验接口。** `omni.hooks` 与 `omni.providers` 一样，任何 minor 版本都可能变；拿不到时整条逐字链路降级（打一条警告），LRCLIB 行级歌词不受影响。`folium.host.folium.minor` 可以用来做功能探测。
+- **艺术家是从标题/简介猜的。** 规则都对着实测样本写过测试（`test/01-offline.mjs`），但猜出来的名字会混进列表：有的视频会显示成「周杰伦 / 晴天 / UP主名」。真名的代价是多几个候选。
+- **YouTube Music 只能搜不能放。** 见上面那一节。
+- **副歌识别**：宿主的内建逻辑读 `mainText`（本模组给的就是 LRC 原文），所以行级歌词能参与文本副歌检测；换成 TTML 之后的行会带上 `isChorus`（来自 `<div itunes:song-part="Chorus">`）。
 
 ## 上架
 
