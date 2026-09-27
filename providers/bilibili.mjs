@@ -11,6 +11,7 @@
 
 import { artistCandidatesFromTitle, extractArtistCandidates } from '../lib/artist-candidates.mjs';
 import { parseCookieHeader } from '../lib/bili-cookie.mjs';
+import { parseVideoRef } from '../lib/bili-video-ref.mjs';
 import { cleanTrackName, stripHtml } from '../lib/match.mjs';
 import { createWbiSigner } from '../lib/wbi.mjs';
 
@@ -123,7 +124,7 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
         getCsrf: csrfToken,
     });
 
-    /** bvid → { cid, durationMs, partName }。搜索接口不返回 cid，取流时补。 */
+    /** bvid → 分 P 数组 [{ cid, name, durationMs }]。搜索接口不返回 cid，取流时补。 */
     const partCache = new Map();
     /** bvid → { entry }；entry 为 null 表示「这个 bvid 的 view 拿不到」，也要缓存。 */
     const viewCache = new Map();
@@ -163,9 +164,13 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
      * 取视频的分 P 列表。用 /x/player/pagelist 而不是 /x/web-interface/wbi/view：
      * 前者不要求 WBI 签名、不要求 cookie，实测最稳。
      *
-     * @returns {Promise<{ cid: number, partName: string, durationMs: number } | null>}
+     * 多 P 支持从这一层长出来：每个分 P 的 cid 都能拼成 `bili:BV...:cid`，
+     * 那就是一首独立曲目（makeSongId / parseSongId / getAudioUrl 本来就认这个形状）。
+     * 缺的从来不是 id 形状，而是「怎么把那些 cid 交到用户手里」—— 答案见 searchVideoRef。
+     *
+     * @returns {Promise<Array<{ cid: number, name: string, durationMs: number }> | null>}
      */
-    const fetchFirstPart = async (bvid) => {
+    const fetchParts = async (bvid) => {
         const cached = partCache.get(bvid);
         if (cached) return cached;
 
@@ -175,17 +180,58 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
             return null;
         }
 
-        const first = payload.data[0];
-        const cid = Number(first?.cid);
-        if (!Number.isFinite(cid) || cid <= 0) return null;
+        // 实测 250 P 的合集也走这一个请求（BV1os41197sv），所以整列表拿回来不心疼
+        const parts = payload.data
+            .map((entry) => ({
+                cid: Number(entry?.cid),
+                name: typeof entry?.part === 'string' ? entry.part : '',
+                durationMs: Number(entry?.duration) > 0 ? Number(entry.duration) * 1000 : 0,
+            }))
+            .filter((part) => Number.isFinite(part.cid) && part.cid > 0);
+        if (parts.length === 0) return null;
 
-        const part = {
-            cid,
-            partName: typeof first?.part === 'string' ? first.part : '',
-            durationMs: Number(first?.duration) > 0 ? Number(first.duration) * 1000 : 0,
-        };
-        remember(partCache, bvid, part);
-        return part;
+        remember(partCache, bvid, parts);
+        return parts;
+    };
+
+    const fetchFirstPart = async (bvid) => (await fetchParts(bvid))?.[0] ?? null;
+
+    /**
+     * 定位一个分 P。
+     *
+     * 优先级：id 里的 cid → 链接里的 ?p= → 第一个。
+     * `total > 1` 时标题要带分 P 名，否则一个 250 P 的合集在队列里就是 250 首同名曲目。
+     *
+     * cid 不在列表里时**不返回 null**：那可能是旧的收藏（分 P 被删了、稿件被重传）。
+     * 元数据拿不到没关系，取流只认 cid，照样能放 —— 让队列变成「不可播放」比让它少一个名字糟得多。
+     */
+    const resolvePart = async (bvid, ref = {}) => {
+        const parts = await fetchParts(bvid);
+        if (!parts) return null;
+
+        if (ref.cid) {
+            const index = parts.findIndex((part) => part.cid === ref.cid);
+            if (index >= 0) return { part: parts[index], index, total: parts.length };
+            return { part: { cid: ref.cid, name: '', durationMs: 0 }, index: -1, total: parts.length };
+        }
+        if (ref.page) {
+            const index = ref.page - 1;
+            if (index >= 0 && index < parts.length) return { part: parts[index], index, total: parts.length };
+        }
+        return { part: parts[0], index: 0, total: parts.length };
+    };
+
+    /**
+     * 曲目标题。多 P 时拼上分 P 名。
+     *
+     * 宿主只拿得到 title 一个字符串，所以「这是第几 P」只能写在这里。
+     * 单 P 视频不拼：那种稿件的分 P 名常常等于标题（或干脆是「P1」），拼上去是噪音。
+     */
+    const displayTitle = ({ viewTitle, partName, bvid, total }) => {
+        const name = String(partName ?? '').trim();
+        const base = String(viewTitle ?? '').trim() || name || bvid;
+        if (total > 1 && name && name !== base) return `${base} - ${name}`;
+        return base;
     };
 
     /**
@@ -282,6 +328,63 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
         knownArtists.set(bvid, merged);
     };
 
+    /**
+     * 按视频引用取条目：一个分 P 一条，每个 id 都是 `bili:BV...:cid`。
+     *
+     * 为什么要从 search 走这条路：宿主给 provider 的只有 search / getSong / getAudioUrl /
+     * getLyrics 四个口子（FoliumOmniProviderDef），**没有**「列出这个视频的分 P」这种接口；
+     * 而 `folium.playback.playSong` 只认宿主自己发出去的 ref，模组没法凭空把一首歌塞进队列。
+     * search 收的是一串文本，于是它成了唯一能把分 P 交给用户的入口。
+     * 约定：搜索框里粘 BV 号或视频链接 = 要这个视频的分 P。
+     *
+     * 为什么不在普通关键词搜索里顺带展开多 P：一页 20 条结果就要 20 次 pagelist。
+     * 点进去的那一条（getSong 会带上 cid 与分 P 名）本来就是对的，够用了。
+     */
+    const searchVideoRef = async (ref) => {
+        const parts = await fetchParts(ref.bvid);
+        if (!parts) {
+            log?.info?.('bili video lookup failed', { bvid: ref.bvid });
+            return { items: [], hasMore: false };
+        }
+
+        const view = await fetchView(ref.bvid);
+        const artists = (await artistCandidatesFor(ref.bvid, null)).slice(0, DISPLAY_ARTIST_LIMIT);
+        const displayArtists = artists.length > 0
+            ? artists
+            : extractArtistCandidates({ title: view?.title, limit: DISPLAY_ARTIST_LIMIT });
+
+        // ?p=3 就要第 3 个分 P（用户从地址栏复制过来时通常只想要那一个）；
+        // 给了 cid 就只要那一个；什么都没给就是整个视频。
+        let selected = parts;
+        if (ref.cid) {
+            selected = parts.filter((part) => part.cid === ref.cid);
+        } else if (ref.page) {
+            selected = parts.slice(ref.page - 1, ref.page);
+        }
+
+        const items = selected.map((part) => ({
+            id: makeSongId(ref.bvid, part.cid),
+            title: displayTitle({
+                viewTitle: view?.title,
+                partName: part.name,
+                bvid: ref.bvid,
+                total: parts.length,
+            }),
+            // 与关键词搜索不同：这里的 results 是用户点名要的，标题和封面都已经拿到了，
+            // 所以直接把艺术家候选放上去，不必再等 getSong 补
+            artists: displayArtists,
+            coverUrl: view?.coverUrl,
+            durationMs: part.durationMs > 0 ? part.durationMs : view?.durationMs,
+        }));
+        log?.info?.('bili video lookup', {
+            bvid: ref.bvid,
+            parts: parts.length,
+            returned: items.length,
+            page: ref.page ?? undefined,
+        });
+        return { items, hasMore: false, total: items.length };
+    };
+
     return {
         id: 'bilibili',
         displayName: 'Bilibili（NeriPlayer 桥）',
@@ -290,6 +393,10 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
         async search(query, page) {
             const keyword = String(query ?? '').trim();
             if (!keyword) return { items: [], hasMore: false };
+
+            // 粘进来的是视频（BV 号 / 视频链接）就按分 P 列出来，见 searchVideoRef
+            const ref = parseVideoRef(keyword);
+            if (ref) return searchVideoRef(ref);
 
             const pageSize = Math.min(Math.max(Number(page?.limit) || 20, 1), MAX_PAGE_SIZE);
             const pageNumber = Math.floor((Number(page?.offset) || 0) / pageSize) + 1;
@@ -345,13 +452,18 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
             const { bvid, cid } = parseSongId(id);
             if (!bvid) return null;
 
-            const part = await fetchFirstPart(bvid);
-            const resolvedCid = cid ?? part?.cid;
+            const resolved = await resolvePart(bvid, { cid });
+            const resolvedCid = resolved?.part.cid ?? null;
             if (!resolvedCid) return null;
 
             // view 能给出真正的标题、封面与艺术家候选；拿不到就退回分 P 名
             const view = await fetchView(bvid);
-            const title = view?.title || part?.partName || bvid;
+            const title = displayTitle({
+                viewTitle: view?.title,
+                partName: resolved.part.name,
+                bvid,
+                total: resolved.total,
+            });
             const artists = (await artistCandidatesFor(bvid, null)).slice(0, DISPLAY_ARTIST_LIMIT);
 
             // 标题也参与候选提取：view 挂掉时它就是唯一线索
@@ -364,8 +476,9 @@ export const createBilibiliProvider = ({ http, lrclib, log, getCookie, wordTimin
                 title: String(title).trim() || bvid,
                 artists: displayArtists,
                 coverUrl: view?.coverUrl,
-                durationMs: part?.durationMs > 0
-                    ? part.durationMs
+                // 分 P 自己的时长优先：一个 250 P 合集的总时长不是任何一首歌的时长
+                durationMs: resolved.part.durationMs > 0
+                    ? resolved.part.durationMs
                     : view?.durationMs > 0 ? view.durationMs : undefined,
             };
         },
