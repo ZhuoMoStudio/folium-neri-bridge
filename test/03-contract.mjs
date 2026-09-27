@@ -4,6 +4,8 @@
 //
 // 第 6–8 节把打桩宿主补上了实验接口与设置分区的 params，
 // 于是「钩子按正确的名字注册」与「设置开关真的控制 provider 注册」也能在这里验。
+// 第 9 节直接构造 main 入口（没有 electron，所以监听器一定装不上，但 rpc 注册
+// 与登录态逻辑不依赖 electron）：客户端会调的每个名字都必须在那边存在。
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -221,6 +223,22 @@ check('注册了命令', host.state.commands.length > 0, host.state.commands.map
 check('每个命令有 id/label/run', host.state.commands.every((c) =>
     typeof c.id === 'string' && c.label && typeof c.run === 'function'));
 check('命令 id 不含冒号（宿主会自动加命名空间）', host.state.commands.every((c) => !c.id.includes(':')), host.state.commands.map((c) => c.id).join(','));
+check(
+    '注册了自检命令，且带一个可选的曲目参数',
+    host.state.commands.some((c) => c.id === 'selfcheck' && (c.params ?? []).some((p) => p.key === 'songId' && p.type === 'text')),
+    JSON.stringify(host.state.commands.find((c) => c.id === 'selfcheck')?.params?.map((p) => p.key)),
+);
+check(
+    '注册了「列出分 P」命令，带一个视频参数',
+    host.state.commands.some((c) => c.id === 'parts' && (c.params ?? []).some((p) => p.key === 'video')),
+    JSON.stringify(host.state.commands.find((c) => c.id === 'parts')?.params?.map((p) => p.key)),
+);
+check(
+    '命令的参数 schema 能被上游接受（key/type/label 齐全）',
+    host.state.commands.every((c) => (c.params ?? []).every((p) =>
+        typeof p.key === 'string' && ['number', 'text', 'boolean', 'select'].includes(p.type) && p.label)),
+    JSON.stringify(host.state.commands.map((c) => (c.params ?? []).map((p) => [p.key, p.type]))),
+);
 
 check('activate 返回 disposer', typeof dispose === 'function');
 if (typeof dispose === 'function') {
@@ -326,5 +344,95 @@ check(
     youtube?.getAudioUrl === undefined,
     String(typeof youtube?.getAudioUrl),
 );
+
+console.log('\n== 9. index.cjs 的 main 入口：rpc 名字和方法与客户端对得上 ==');
+// 客户端调的每个名字都必须在这里注册过，否则点下去就是 rpc-not-found。
+// 没有 electron，所以 Referer 监听器一定装不上（expected: failed），
+// 但 RPC 注册与登录态逻辑不依赖 electron，正好在这里验。
+const createMainApi = () => {
+    const handlers = new Map();
+    const warnings = [];
+    return {
+        api: {
+            log: { info: () => {}, warn: (message) => warnings.push(String(message)), error: () => {} },
+            storage: { data: { get: async () => undefined, set: async () => undefined } },
+            rpc: { handle: (name, fn) => handlers.set(name, fn) },
+        },
+        handlers,
+        warnings,
+    };
+};
+
+const main = createMainApi();
+let mainDispose = null;
+let mainError = null;
+try {
+    mainDispose = mainEntry(main.api);
+} catch (error) {
+    mainError = error;
+}
+check('main 入口能在没有 electron 的环境里构造出来', mainError === null, String(mainError?.message ?? ''));
+
+const EXPECTED_RPC = [
+    'bili.login.create',
+    'bili.login.poll',
+    'bili.login.openWindow',
+    'bili.session.read',
+    'bili.session.status',
+    'bili.session.set',
+    'bili.session.clear',
+    'bili.diagnose',
+];
+check(
+    '注册了客户端会用到的全部 rpc 名字',
+    EXPECTED_RPC.every((name) => main.handlers.has(name)),
+    `缺 ${EXPECTED_RPC.filter((name) => !main.handlers.has(name)).join(',') || '无'}`,
+);
+check('每个 rpc 都是函数', [...main.handlers.values()].every((handler) => typeof handler === 'function'));
+check(
+    '没有 electron 时如实记下监听器装不上（而不是静默）',
+    main.warnings.some((message) => message.includes('referer') || message.includes('session unavailable')),
+    main.warnings.join(' | '),
+);
+
+if (mainError === null) {
+    const diagnose = await main.handlers.get('bili.diagnose')();
+    check('diagnose 报出监听器状态与改写计数', diagnose?.referer?.state === 'failed' && diagnose.referer.rewrites === 0, JSON.stringify(diagnose?.referer));
+    check('失败原因是单行（不会把 require stack 灌进命令面板）', !String(diagnose?.referer?.error ?? '').includes('\n'), JSON.stringify(diagnose?.referer?.error));
+    check('diagnose 不泄漏 cookie 值（只给形状）', diagnose?.session?.restored === false && diagnose.session.masked === 'none', JSON.stringify(diagnose?.session));
+
+    const statusBefore = await main.handlers.get('bili.session.status')();
+    check('未登录时 session.status 报出音质受限', statusBefore?.loggedIn === false && statusBefore.quality?.capped === true, JSON.stringify(statusBefore?.quality));
+    check('未登录时 status 里没有 SESSDATA 明文', !JSON.stringify(statusBefore).includes('SESSDATA='));
+
+    const setResult = await main.handlers.get('bili.session.set')('SESSDATA=FAKE_SESSDATA_FOR_TESTS; bili_jct=FAKE_CSRF_FOR_TESTS');
+    check('粘贴 Cookie 能被接受', setResult?.ok === true, JSON.stringify(setResult));
+    const statusAfter = await main.handlers.get('bili.session.status')();
+    check('登录后音质不再标为受限', statusAfter?.loggedIn === true && statusAfter.quality?.capped === false);
+    const diagnoseAfter = await main.handlers.get('bili.diagnose')();
+    check('diagnose 只说「cookie 已恢复」与脱敏形状', diagnoseAfter?.session?.restored === true && /SESSDATA=\w{1,4}…/.test(diagnoseAfter.session.masked), diagnoseAfter?.session?.masked);
+    check('脱敏里不含完整 SESSDATA', !diagnoseAfter.session.masked.includes('FAKE_SESSDATA_FOR_TESTS'));
+
+    const cleared = await main.handlers.get('bili.session.clear')();
+    check('退出登录可用', cleared?.ok === true);
+    check('退出后回到未登录', (await main.handlers.get('bili.session.status')())?.loggedIn === false);
+
+    const badCookie = await main.handlers.get('bili.session.set')('buvid3=only-a-fingerprint');
+    check('没带 SESSDATA 的粘贴被拒', badCookie?.ok === false && badCookie.error === 'missing-sessdata', JSON.stringify(badCookie));
+
+    const badPoll = await main.handlers.get('bili.login.poll')('');
+    check('空 qrcode_key 被挡下（不会真的发请求）', badPoll?.ok === false && badPoll.error === 'missing-key');
+}
+
+if (typeof mainDispose === 'function') {
+    check('main 入口返回 disposer', (() => {
+        try {
+            mainDispose();
+            return true;
+        } catch {
+            return false;
+        }
+    })());
+}
 
 process.exit(summary() === 0 ? 0 : 1);
