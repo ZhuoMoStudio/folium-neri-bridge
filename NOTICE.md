@@ -19,7 +19,7 @@ https://github.com/cwuom/NeriPlayer
 | `providers/bilibili.mjs` | `core/api/bili/BiliClient.kt`（搜索与取流）+ `core/api/bili/BiliSongResolver.kt` |
 | `providers/lyrics/lrclib.mjs` | `core/api/lyrics/LrcLibClient.kt` |
 
-新写的、不是移植的：`lib/http.mjs`、`lib/bili-cookie.mjs`、`client.mjs`、`index.cjs`、`test/*`。
+新写的、不是移植的：`lib/http.mjs`、`lib/bili-cookie.mjs`、`lib/lyric-match.mjs`、`client.mjs`、`index.cjs`、`test/*`。
 
 ## 宿主
 
