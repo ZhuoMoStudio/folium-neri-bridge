@@ -87,8 +87,18 @@ const parseSongId = (id) => {
  * @param lrclib 歌词后端
  * @param log    folium.log
  */
-export const createBilibiliProvider = ({ http, lrclib, log }) => {
-    const wbi = createWbiSigner((url) => http.json(url, { headers: HEADERS }));
+export const createBilibiliProvider = ({ http, lrclib, log, getCookie }) => {
+    /**
+     * 每次请求现取一次头：登录态可能在会话中被改（面板里登录/退出），
+     * 把 Cookie 固定在模块常量里就会一直用旧的。
+     */
+    const headersFor = () => {
+        const cookie = typeof getCookie === 'function' ? getCookie() : '';
+        return cookie ? { ...HEADERS, Cookie: cookie } : HEADERS;
+    };
+    const loggedIn = () => Boolean(typeof getCookie === 'function' ? getCookie() : '');
+
+    const wbi = createWbiSigner((url) => http.json(url, { headers: headersFor() }));
     /** bvid → { cid, durationMs, partName }。搜索接口不返回 cid，取流时补。 */
     const partCache = new Map();
 
@@ -110,7 +120,7 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
             wbi.invalidate();
             return null;
         }
-        return http.json(url, { headers: HEADERS });
+        return http.json(url, { headers: headersFor() });
     };
 
     /**
@@ -266,6 +276,10 @@ export const createBilibiliProvider = ({ http, lrclib, log }) => {
             if (!stream) {
                 log?.warn?.('bili returned no usable audio stream', { bvid, cid: resolvedCid });
                 return null;
+            }
+            if (!loggedIn() && quality !== 'standard') {
+                // 未登录时 B 站会压低可用音质；这不是错误，但日志里说清楚省得排查
+                log?.info?.('not signed in; Bilibili caps audio quality', { requested: quality });
             }
 
             const url = ensureHttps(stream.baseUrl);

@@ -111,7 +111,7 @@ export const createLrclibBackend = (http) => {
          * @returns {Promise<{ lrc: string, matched: boolean } | null>}
          *         **只返回带时间戳的歌词**。宿主对 getLyrics 的返回值一律走 parseLRC，
          *        而 parseLRC 会丢弃没有 LRC 时间标签的行（parserCore.ts:347 的
-         *         parseSimpleTimedTextEntry 对无标签行返回 null）。所以把纯文本
+         *        parseSimpleTimedTextEntry 对无标签行返回 null）。所以把纯文本
          *        交出去只会得到一个空歌词列表，不如返回 null 诚实。
          */
         async lookup({ title, artist, durationMs, relaxedDuration = false }) {
