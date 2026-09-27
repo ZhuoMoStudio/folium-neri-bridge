@@ -1,17 +1,21 @@
 {
   "name": "folium-neri-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Bilibili 音源接进 Folia 的 Folium 模组平台",
   "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
-    "test": "node test/01-offline.mjs && node test/03-contract.mjs",
+    "test": "node test/01-offline.mjs && node test/03-contract.mjs && node test/06-match.mjs && node test/07-word-timing.mjs",
     "test:offline": "node test/01-offline.mjs",
     "test:contract": "node test/03-contract.mjs",
+    "test:match": "node test/06-match.mjs",
+    "test:words": "node test/07-word-timing.mjs",
     "test:live": "node test/02-live.mjs",
     "test:cdn": "node test/04-cdn.mjs",
     "test:login": "node test/05-login.mjs",
-    "test:all": "npm test && npm run test:live && npm run test:cdn && npm run test:login"
+    "test:amll": "node test/08-amll-live.mjs",
+    "test:youtube": "node test/09-youtube.mjs",
+    "test:all": "npm test && npm run test:live && npm run test:cdn && npm run test:login && npm run test:amll && npm run test:youtube"
   }
 }
