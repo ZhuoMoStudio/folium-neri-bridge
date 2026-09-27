@@ -91,6 +91,8 @@ Folia 的页面来源两种都撞 403（开发 `localhost:3000`、生产 `file:/
 
 **5. `words` 拼接必须等于 `fullText`。** 这不是我们的约定，是宿主的：`enhancedLrcSerializer.ts` 的 `alignWordSegments` 用这条不变量判断要不要自己去 `fullText` 里找词。所以 TTML 里「写在下个 span 开头的空格」要折算到上一个 syllable 的尾部，行末空格要去掉。实测 Idol 的 91 行里就有 1 行以空格结尾，差这一个字符就会让宿主白跑一遍重新对齐。
 
+**6. 第一个艺术家候选可能是错的。** B 站只给 UP 主名，其余候选是从标题/简介里猜的。把猜测拼进 LRCLIB 的搜索关键词，一次错猜就会让整次搜索搜不到东西（实测 `['完全不存在的名字', 'YOASOBI']`）。所以搜索退到纯标题再试一次 —— 本地身份判定本来就对全部候选放行，退一步不会放宽标准。
+
 ## 测
 
 ```bash
@@ -104,6 +106,8 @@ npm run test:all      # 全部
 ```
 
 `03-contract` 不是自己写断言，是加载 folia-major 的 `manifest.cjs` 和打桩宿主，直接跑上游代码。
+
+从干净克隆跑过：109 + 84 + 47 + 92（离线）+ 24 + 10 + 17 + 43 + 30（联网）= **456 项，0 失败**（Node 22.14，2026-09-27）。
 
 `08-amll-live` 与 `09-youtube` 依赖上游可用性（raw.githubusercontent / amll-ttml-db.stevexmh.net / music.youtube.com），它们红了先看是不是上游的事。
 
