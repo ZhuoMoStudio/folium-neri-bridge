@@ -15,6 +15,14 @@ import {
     primaryArtist,
     stripHtml,
 } from '../lib/match.mjs';
+import {
+    cookieFieldsFromSession,
+    describeSession,
+    isValidSession,
+    parseCookieHeader,
+    redactCookie,
+    serializeCookieHeader,
+} from '../lib/bili-cookie.mjs';
 
 console.log('\n== lib/md5.mjs：RFC 1321 标准测试向量 ==');
 check('md5("")', md5('') === 'd41d8cd98f00b204e9800998ecf8427e', md5(''));
@@ -91,5 +99,53 @@ check('title 带 (Official Video) 仍通过', isTitleCompatible('夜に駆ける
 check('title 明显不同应拒绝', !isTitleCompatible('夜に駆ける', '残酷な天使のテーゼ'));
 check('artist 相同通过', isArtistCompatible('YOASOBI', 'YOASOBI'));
 check('artist feat. 差异通过', isArtistCompatible('YOASOBI feat. 幾田りら', 'YOASOBI'));
+
+console.log('\n== lib/bili-cookie.mjs：登录态规范化 ==');
+const SESS = 'abcdef0123456789%2Fxyz==';
+check(
+    '解析标准 Cookie 串',
+    parseCookieHeader(`SESSDATA=${SESS}; bili_jct=deadbeef; DedeUserID=12345`).get('SESSDATA') === SESS,
+);
+check('容忍 Cookie: 前缀', parseCookieHeader(`Cookie: SESSDATA=${SESS}`).get('SESSDATA') === SESS);
+check('容忍换行分隔', parseCookieHeader(`SESSDATA=${SESS}\nbili_jct=x`).get('bili_jct') === 'x');
+check(
+    '容忍值里含 =（base64 的 SESSDATA）',
+    parseCookieHeader('SESSDATA=a=b=c').get('SESSDATA') === 'a=b=c',
+);
+check('忽略空段与畸形段', parseCookieHeader(';; bad ;=x; SESSDATA=ok').size === 1);
+check('不是 cookie 的文本被丢弃', parseCookieHeader('这不是 cookie 文本').size === 0);
+check('非字符串输入返回空表', parseCookieHeader(null).size === 0 && parseCookieHeader(123).size === 0);
+
+const fields = parseCookieHeader(`DedeUserID=99; SESSDATA=${SESS}; bili_jct=csrf`);
+const header = serializeCookieHeader(fields);
+check('序列化后必需的字段在前', header.startsWith(`SESSDATA=${SESS};`), header.slice(0, 40));
+check(
+    '序列化可往返',
+    serializeCookieHeader(parseCookieHeader(header)) === header,
+);
+check('空表序列化为空串', serializeCookieHeader(new Map()) === '' && serializeCookieHeader(null) === '');
+
+check('有 SESSDATA 才算已登录', isValidSession(parseCookieHeader(`SESSDATA=${SESS}`)));
+check('缺 SESSDATA 视为未登录', !isValidSession(parseCookieHeader('bili_jct=csrf')));
+check('空表视为未登录', !isValidSession(new Map()));
+
+const sessionCookies = cookieFieldsFromSession([
+    { name: 'SESSDATA', value: SESS, domain: '.bilibili.com' },
+    { name: 'bili_jct', value: 'csrf', domain: '.bilibili.com' },
+    { name: 'SESSDATA', value: 'should-be-overwritten', domain: 'passport.bilibili.com' },
+    { name: 'ga', value: 'x', domain: '.google.com' },
+]);
+check('只收 bilibili.com 域的 cookie', !sessionCookies.has('ga'), JSON.stringify([...sessionCookies.keys()]));
+check('同名以最后一次为准', sessionCookies.get('SESSDATA') === 'should-be-overwritten');
+check('空输入不炸', cookieFieldsFromSession(null).size === 0 && cookieFieldsFromSession([]).size === 0);
+check('缺 domain 的条目被跳过', cookieFieldsFromSession([{ name: 'SESSDATA', value: 'x' }]).size === 0);
+
+const redacted = redactCookie(parseCookieHeader(`SESSDATA=${SESS}; bili_jct=csrf`));
+check('脱敏后不含完整 SESSDATA', !redacted.includes(SESS), redacted);
+check('脱敏后仍能看出字段构成', redacted.includes('bili_jct'), redacted);
+check('空值脱敏为 none', redactCookie(new Map()) === 'none');
+
+const described = describeSession(fields);
+check('describeSession 报出登录态', described.loggedIn && described.userId === '99' && described.hasCsrf);
 
 process.exit(summary() === 0 ? 0 : 1);

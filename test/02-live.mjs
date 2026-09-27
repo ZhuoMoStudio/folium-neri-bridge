@@ -118,7 +118,7 @@ if (audio?.url) {
 
     check('带 B 站 Referer 可用 ⇒ 修复后一定能播', [200, 206].includes(fixed?.status), `status=${fixed?.status}`);
     check('localhost Referer 被拒 ⇒ 证明 main 入口确有必要', devOrigin?.status === 403, `status=${devOrigin?.status}`);
-    console.log(`    ℹ 无 Referer 本次返回 ${noReferer?.status ?? '网络层失败'}（随 CDN 变化，见 test/04-cdn.mjs）`);
+    console.log(`    ℹ 无 Referer 本次返回 ${noReferer?.status}（随 CDN 变化，见 test/04-cdn.mjs）`);
 }
 
 // ------------------------------------------------------------ 6. LRCLIB
