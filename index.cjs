@@ -113,28 +113,29 @@ const readSetCookie = (response) => {
     return single ? [single] : [];
 };
 
-/** 从 Legacy 的 data.url 里读 cookie 参数（2026-08 之前的行为）。 */
-const cookieFieldsFromTicketUrl = (ticketUrl, parseCookieHeader) => {
-    const fields = new Map();
-    if (typeof ticketUrl !== 'string' || !ticketUrl) return fields;
-    try {
-        const url = new URL(ticketUrl, 'https://passport.bilibili.com');
-        for (const [name, value] of url.searchParams) {
-            if (name === 'SESSDATA' || name === 'bili_jct' || name === 'DedeUserID' || name.endsWith('__ckMd5')) {
-                fields.set(name, value);
-            }
-        }
-    } catch {
-        // 不是合法 URL 就当作没有
-    }
-    return fields;
-};
+// 登录成功凭据的三条来源、以及 Legacy 票据链接的解析，都在 lib/bili-login.cjs 里。
+// 拆出去的理由是可测：真机扫码在沙盒里做不了，但那份判断可以拿 fixture 离线重放（test/10）。
+// 用 require 而不是动态 import，是因为 rpc 处理器里要同步取到它。
+const loginLib = require('./lib/bili-login.cjs');
+const { cookieFieldsFromTicketUrl } = loginLib;
 
 const activate = (api) => {
     const log = api.log;
     let detachWebRequest = null;
     let loginWindow = null;
     let loginPoller = null;
+
+    /**
+     * Referer 监听器的状态。这三项是「自检」命令要读的东西 ——
+     * 没有它们，用户能看到的只有播放失败，看不到失败发生在哪一层。
+     *
+     * `refererRewrites` 是**真的能证明监听器在干活**的计数器：`<audio>` 探测前后各读一次，
+     * 涨了就说明这次请求确实是从监听器里过的，而不是「装上了但从没被调用过」。
+     */
+    let refererState = 'unavailable';
+    let refererError = null;
+    let refererRewrites = 0;
+    let refererLastHost = null;
 
     const storageGet = async (key) => {
         try {
@@ -220,14 +221,15 @@ const activate = (api) => {
      * 而是一个 crossDomain 票据链接，真正的 SESSDATA / bili_jct / DedeUserID 由
      * 跟随该链接时的 Set-Cookie 下发。只解析 data.url 查询串的实现会「报成功但存到空凭据」。
      * 所以这里三条路都走：poll 响应自身的 Set-Cookie、票据链接跟随后的 Set-Cookie、
-     * 以及 Legacy 的查询串解析。
+     * 以及 Legacy 的查询串解析。三条路的合并顺序由 lib/bili-login.cjs 的
+     * resolveLoginCookies 决定（那个函数可以拿 fixture 离线重放，见 test/10-selfcheck.mjs）。
      */
     const loginPoll = async (key) => {
         if (typeof key !== 'string' || !key.trim()) return { ok: false, error: 'missing-key' };
         const lib = await loadCookieLib();
 
         const response = await biliFetch(`${QR_POLL_URL}?qrcode_key=${encodeURIComponent(key)}`);
-        const setCookies = readSetCookie(response);
+        const pollSetCookies = readSetCookie(response);
         const payload = await response.json().catch(() => null);
         if (payload?.code !== 0) {
             return { ok: false, error: `poll-failed:${payload?.code ?? response.status}` };
@@ -238,34 +240,38 @@ const activate = (api) => {
         const result = { ok: true, state, message: String(data.message ?? '') };
         if (state !== 0) return result;
 
-        const fields = new Map();
-        for (const raw of setCookies) {
-            for (const [name, value] of lib.parseCookieHeader(raw.split(';')[0])) fields.set(name, value);
-        }
         const ticketUrl = String(data.url ?? '');
-        if (!lib.isValidSession(fields) && ticketUrl) {
+
+        // 轮询响应自己就带着 SESSDATA 时就不多跳一次（省一次请求，也少一次被风控看到的机会）
+        let ticketSetCookies = [];
+        if (!loginLib.hasSessionCookie(pollSetCookies) && ticketUrl) {
             try {
                 // 用浏览器 UA 跟随票据链接，cookie 在这一跳的响应头上
                 const ticketResponse = await biliFetch(ticketUrl);
-                for (const raw of readSetCookie(ticketResponse)) {
-                    for (const [name, value] of lib.parseCookieHeader(raw.split(';')[0])) fields.set(name, value);
-                }
+                ticketSetCookies = readSetCookie(ticketResponse);
             } catch (error) {
                 log?.warn?.('ticket follow failed', { message: String(error?.message ?? error) });
             }
         }
-        if (!lib.isValidSession(fields)) {
-            for (const [name, value] of cookieFieldsFromTicketUrl(ticketUrl, lib.parseCookieHeader)) {
-                fields.set(name, value);
-            }
+
+        // 三条路（poll 的 Set-Cookie / 票据那一跳的 Set-Cookie / Legacy 查询串）的
+        // 合并顺序与优先级由这个纯函数决定，理由见 lib/bili-login.cjs
+        const resolved = loginLib.resolveLoginCookies({ pollSetCookies, ticketSetCookies, ticketUrl });
+        if (!resolved.hasSession) {
+            log?.warn?.('bilibili login returned no usable cookie', {
+                state,
+                routes: loginLib.describeLoginRoutes(resolved.routes),
+                legacy: resolved.legacy,
+            });
+            return { ok: false, error: 'login-succeeded-but-no-cookie', state, routes: resolved.routes };
         }
 
-        if (!lib.isValidSession(fields)) {
-            return { ok: false, error: 'login-succeeded-but-no-cookie', state };
-        }
-        await persistCookie(fields);
-        log?.info?.('bilibili login ok', { session: cookieDescription });
-        return { ...result, loggedIn: true, session: lib.describeSession(fields) };
+        await persistCookie(resolved.fields);
+        log?.info?.('bilibili login ok', {
+            session: cookieDescription,
+            routes: loginLib.describeLoginRoutes(resolved.routes),
+        });
+        return { ...result, loggedIn: true, session: lib.describeSession(resolved.fields), routes: resolved.routes };
     };
 
     /**
@@ -345,11 +351,42 @@ const activate = (api) => {
     const sessionStatus = async () => {
         const lib = await loadCookieLib();
         const fields = lib.parseCookieHeader(cookieHeader);
+        const loggedIn = lib.isValidSession(fields);
         return {
             ok: true,
-            loggedIn: lib.isValidSession(fields),
+            loggedIn,
             session: lib.describeSession(fields),
             masked: cookieDescription,
+            // 未登录时 B 站只给匿名档位。这条以前只写进日志，用户看不到，
+            // 于是「库里 192K 的条目放不出更高的档」会被当成模组的问题。
+            quality: lib.describeQualityCap(loggedIn),
+        };
+    };
+
+    /**
+     * 自检要的事实。都在主进程侧 —— 渲染端问不到的东西正是这几样：
+     * 监听器到底装上没装上、它被调用过几次、当前登录态是什么。
+     */
+    const diagnose = async () => {
+        let electronAvailable = false;
+        try {
+            electronAvailable = Boolean(require('electron')?.session);
+        } catch {
+            electronAvailable = false;
+        }
+        return {
+            ok: true,
+            referer: {
+                state: refererState,
+                error: refererError,
+                hosts: MEDIA_URL_FILTERS.length,
+                rewrites: refererRewrites,
+                lastRewriteHost: refererLastHost,
+            },
+            electron: { available: electronAvailable },
+            // 登录态在渲染端也有一份缓存，这里给的是主进程实际在用的那一份。
+            // 只给形状，不给值（SESSDATA 等价于账号本身）。
+            session: { restored: Boolean(cookieHeader), masked: cookieDescription },
         };
     };
 
@@ -368,6 +405,7 @@ const activate = (api) => {
         const { session } = require('electron');
         const ses = session?.defaultSession;
         if (!ses?.webRequest?.onBeforeSendHeaders) {
+            refererState = 'unavailable';
             log?.warn?.('electron session unavailable; Bilibili media will 403 on a non-Bilibili origin');
         } else {
             const listener = (details, callback) => {
@@ -376,6 +414,11 @@ const activate = (api) => {
                     return;
                 }
                 const rewritten = applyBilibiliHeaders(details?.requestHeaders, cookieHeader);
+                if (rewritten) {
+                    // 计数是自检的证据：装上不等于生效，被调用过才算
+                    refererRewrites += 1;
+                    refererLastHost = hostOf(details?.url) || null;
+                }
                 callback({ requestHeaders: rewritten ?? details?.requestHeaders });
             };
             ses.webRequest.onBeforeSendHeaders({ urls: MEDIA_URL_FILTERS }, listener);
@@ -386,10 +429,15 @@ const activate = (api) => {
                     log?.warn?.('failed to detach referer listener', { message: String(error?.message ?? error) });
                 }
             };
+            refererState = 'installed';
             log?.info?.('bilibili referer guard installed', { hosts: MEDIA_URL_FILTERS.length });
         }
     } catch (error) {
-        log?.warn?.('failed to install bilibili referer guard', { message: String(error?.message ?? error) });
+        refererState = 'failed';
+        // 只要第一行：`require('electron')` 失败时 message 里带着整个 require stack，
+        // 它会一路显示到命令面板上
+        refererError = String(error?.message ?? error).split('\n')[0];
+        log?.warn?.('failed to install bilibili referer guard', { message: refererError });
     }
 
     for (const [name, handler] of Object.entries({
@@ -403,6 +451,7 @@ const activate = (api) => {
             await clearCookie();
             return { ok: true };
         },
+        'bili.diagnose': diagnose,
     })) {
         try {
             api.rpc.handle(name, handler);
