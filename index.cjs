@@ -1,49 +1,47 @@
 // index.cjs —— 模组的 main 入口（主进程，Node 环境）
 //
-// 这里只做一件事：让 B 站 CDN 上的音频能被 <audio> 播出来。
+// 这里做两件事，都必须在主进程才能做：
 //
-// 背景（2026-09-27 实测，test/02-live.mjs 与 test/04-cdn.mjs）：
-// B 站同时用两个 CDN 家族，防盗链策略不同：
+// 1. 【防盗链】让 B 站 CDN 上的音频能被 <audio> 播出来。
+//    实测两个 CDN 家族策略不同：
+//      upos-sz-mirrorcosov.bilivideo.com   带 B 站 Referer → 206   不带 → 403
+//      upos-hz-mirrorakam.akamaized.net    带 B 站 Referer → 206   不带 → 206
+//    而 Folia 的页面来源（dev localhost:3000 / 生产 file://）两种都被 403，
+//    且 <audio> 无法自定义请求头，所以只能在这一层改写 Referer。
 //
-//   upos-sz-mirrorcosov.bilivideo.com   带 B 站 Referer → 206   不带 → 403
-//   upos-hz-mirrorakam.akamaized.net    带 B 站 Referer → 206   不带 → 206
+// 2. 【登录】用 Electron 的会话 cookie 做登录态。
+//    folium.net.fetch 拿不到可靠的 Set-Cookie —— modSystem.cjs:935 用
+//    `headers.forEach((v,k)=>obj[k]=v)` 归一化，undici 会把多个 Set-Cookie
+//    用逗号合并，而 cookie 的 Expires 自身含逗号，信息就丢了。
+//    所以登录走 BrowserWindow + session.cookies，不经过 folium.net.fetch。
 //
-// 也就是说「不带 Referer 也行」是 CDN 相关的：只测一个节点会得出自相矛盾的结论。
-// 而 Folia 的页面来源恰好是两种都不行的情况：
-//   开发模式 http://localhost:3000（main.cjs:4205 loadURL）→ 403
-//   生产模式 file://（main.cjs:4209 loadFile）              → 403
-//
-// <audio> 元素无法自定义请求头，所以只能在这一层把 Referer 顶掉。
-// 做法是「一律改成 https://www.bilibili.com/」，不是「删掉」—— 后者在 bilivideo 上仍 403。
-//
-// 为什么不走「本地回环代理」：那个方案要占端口、管生命周期、自己实现 Range
-// （DASH 的 m4s 分片必须支持断点续传），三个新的出错点换同一个结果。
-// webRequest 这一层只改两个请求头，代价小得多。
-//
-// 为什么不会误伤 API 请求：folium.net.fetch 在主进程里用 Node 的全局 fetch 发请求
-// （见 electron/modSystem/modSystem.cjs:874 的注释与 :910 的调用），不经过 Chromium 的
-// session，因此本监听器碰不到它。B 站接口需要的 Referer 仍然由 providers 自己带上。
+// 为什么不会误伤接口请求：folium.net.fetch 在主进程里用 Node 全局 fetch
+// （modSystem.cjs:874 的注释与 :910 的调用），不经过 Chromium 的 session，
+// 本文件注册的 webRequest 监听器碰不到它。
 
-/**
- * 只在这几个域上动手。api.bilibili.com 不在其中，接口调用不受影响。
- *
- * 域名清单来自实测采样（test/04-cdn.mjs，6 次 playurl 共 18 条流）：
- *   upos-sz-mirrorcosov.bilivideo.com   13 条
- *   upos-hz-mirrorakam.akamaized.net     5 条
- */
+/** 只在这几个域上动手。api.bilibili.com 不在其中，接口调用不受影响。 */
 const MEDIA_URL_FILTERS = [
     '*://*.bilivideo.com/*',
     '*://*.bilivideo.cn/*',
-    // akamaized.net 是共享域名，不能只靠域名判定；真正的把关在 isBilibiliCdn 里
+    // akamaized.net 是共享域名，真正的把关在 isBilibiliCdn 里
     '*://*.akamaized.net/*',
     '*://*.hdslb.com/*',
 ];
 
-/** 唯一实测可用的 Referer。 */
 const BILIBILI_REFERER = 'https://www.bilibili.com/';
-
-/** B 站取流地址里固定出现的路径片段，用来把共享域名上的无关请求排除掉。 */
+const BILIBILI_ORIGIN = 'https://www.bilibili.com';
 const BILIBILI_MEDIA_PATH = /\/upgcxcode\//;
+const WEB_UA =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+const LOGIN_URL = 'https://passport.bilibili.com/login';
+const QR_GENERATE_URL = 'https://passport.bilibili.com/x/passport-login/web/qrcode/generate';
+const QR_POLL_URL = 'https://passport.bilibili.com/x/passport-login/web/qrcode/poll';
+const LOGIN_REFERER = 'https://passport.bilibili.com/login';
+
+const STORAGE_KEY = 'bilibiliCookie';
+/** 登录窗口关掉后多久放弃等待，避免轮询永远跑着。 */
+const LOGIN_WINDOW_TIMEOUT_MS = 5 * 60 * 1000;
 
 const hostOf = (url) => {
     try {
@@ -83,71 +81,357 @@ const hasHeader = (headers, wanted) => {
     return Object.keys(headers).some((name) => name.toLowerCase() === wanted);
 };
 
-/** 这个请求需不需要改写。已经是正确 Referer 且没有 Origin 时就不用动。 */
-const needsRefererRewrite = (requestHeaders) =>
-    headerValue(requestHeaders, 'referer') !== BILIBILI_REFERER ||
-    hasHeader(requestHeaders, 'origin');
+/** 这个请求需不需要改写。已经是正确 Referer 且没有多余头时就不用动。 */
+const needsHeaderRewrite = (requestHeaders, cookie) => {
+    if (headerValue(requestHeaders, 'referer') !== BILIBILI_REFERER) return true;
+    if (hasHeader(requestHeaders, 'origin')) return true;
+    if (cookie && headerValue(requestHeaders, 'cookie') !== cookie) return true;
+    return false;
+};
 
 /** 返回改写后的头对象；不需要改写时返回 null，调用方据此跳过。 */
-const applyBilibiliReferer = (requestHeaders) => {
-    if (!needsRefererRewrite(requestHeaders)) return null;
+const applyBilibiliHeaders = (requestHeaders, cookie) => {
+    if (!needsHeaderRewrite(requestHeaders, cookie)) return null;
     const next = { ...requestHeaders };
-    // 先清掉大小写不定的旧值，再统一写入一个
     for (const name of Object.keys(next)) {
         const lower = name.toLowerCase();
         if (lower === 'referer' || lower === 'origin') delete next[name];
+        // Cookie 只在登录后接管：没登录时保留浏览器原本的（可能带着匿名指纹 buvid3）
+        if (lower === 'cookie' && cookie) delete next[name];
     }
     next.Referer = BILIBILI_REFERER;
+    if (cookie) next.Cookie = cookie;
     return next;
+};
+
+/** 响应上的 Set-Cookie。Node 18+ 的 undici 才有 getSetCookie，所以要留退路。 */
+const readSetCookie = (response) => {
+    const headers = response?.headers;
+    if (!headers) return [];
+    if (typeof headers.getSetCookie === 'function') return headers.getSetCookie();
+    const single = headers.get?.('set-cookie');
+    return single ? [single] : [];
+};
+
+/** 从 Legacy 的 data.url 里读 cookie 参数（2026-08 之前的行为）。 */
+const cookieFieldsFromTicketUrl = (ticketUrl, parseCookieHeader) => {
+    const fields = new Map();
+    if (typeof ticketUrl !== 'string' || !ticketUrl) return fields;
+    try {
+        const url = new URL(ticketUrl, 'https://passport.bilibili.com');
+        for (const [name, value] of url.searchParams) {
+            if (name === 'SESSDATA' || name === 'bili_jct' || name === 'DedeUserID' || name.endsWith('__ckMd5')) {
+                fields.set(name, value);
+            }
+        }
+    } catch {
+        // 不是合法 URL 就当作没有
+    }
+    return fields;
 };
 
 const activate = (api) => {
     const log = api.log;
-    let detach = null;
+    let detachWebRequest = null;
+    let loginWindow = null;
+    let loginPoller = null;
+
+    const storageGet = async (key) => {
+        try {
+            return await api.storage.data.get(key);
+        } catch (error) {
+            log?.warn?.('storage read failed', { message: String(error?.message ?? error) });
+            return undefined;
+        }
+    };
+    const storageSet = async (key, value) => {
+        try {
+            await api.storage.data.set(key, value);
+        } catch (error) {
+            log?.warn?.('storage write failed', { message: String(error?.message ?? error) });
+        }
+    };
+
+    // bili-cookie.mjs 是 ESM，index.cjs 是 CJS。ESM 动态 import 两边都能用，
+    // 这样规范化逻辑只有一份，不在这里抄一遍。webRequest 监听器是同步的，
+    // 但它只读下面这两个已经缓存的字符串，不需要 await。
+    let cookieLib = null;
+    const loadCookieLib = async () => {
+        cookieLib ??= await import('./lib/bili-cookie.mjs');
+        return cookieLib;
+    };
+
+    /** 当前登录态。两个缓存变量是为了让同步的 webRequest 监听器能读到。 */
+    let cookieHeader = '';
+    let cookieDescription = 'none';
+
+    const applyCookieHeader = async (header) => {
+        cookieHeader = typeof header === 'string' ? header : '';
+        const lib = await loadCookieLib();
+        const fields = lib.parseCookieHeader(cookieHeader);
+        cookieDescription = lib.redactCookie(fields);
+        return fields;
+    };
+
+    const persistCookie = async (fields) => {
+        const lib = await loadCookieLib();
+        const header = lib.serializeCookieHeader(fields);
+        await applyCookieHeader(header);
+        await storageSet(STORAGE_KEY, header);
+        return header;
+    };
+
+    const clearCookie = async () => {
+        cookieHeader = '';
+        cookieDescription = 'none';
+        await storageSet(STORAGE_KEY, '');
+    };
+
+    const biliFetch = (url, init = {}) =>
+        fetch(url, {
+            ...init,
+            headers: {
+                'User-Agent': WEB_UA,
+                Referer: LOGIN_REFERER,
+                Origin: BILIBILI_ORIGIN,
+                ...(init.headers ?? {}),
+            },
+        });
+
+    // ---------------------------------------------------------------- 登录流程
+
+    /** 生成扫码登录会话。返回的 qrContent 交给渲染端去画二维码。 */
+    const loginCreate = async () => {
+        const response = await biliFetch(QR_GENERATE_URL);
+        const payload = await response.json().catch(() => null);
+        if (payload?.code !== 0) {
+            return { ok: false, error: `generate-failed:${payload?.code ?? response.status}` };
+        }
+        const key = String(payload?.data?.qrcode_key ?? '').trim();
+        const qrContent = String(payload?.data?.url ?? '').trim();
+        if (!key || !qrContent) return { ok: false, error: 'generate-empty' };
+        return { ok: true, key, qrContent };
+    };
+
+    /**
+     * 轮询扫码状态。
+     *
+     * 2026-08 起 B 站改了成功响应的形状：data.url 不再是「查询串里带 cookie」的地址，
+     * 而是一个 crossDomain 票据链接，真正的 SESSDATA / bili_jct / DedeUserID 由
+     * 跟随该链接时的 Set-Cookie 下发。只解析 data.url 查询串的实现会「报成功但存到空凭据」。
+     * 所以这里三条路都走：poll 响应自身的 Set-Cookie、票据链接跟随后的 Set-Cookie、
+     * 以及 Legacy 的查询串解析。
+     */
+    const loginPoll = async (key) => {
+        if (typeof key !== 'string' || !key.trim()) return { ok: false, error: 'missing-key' };
+        const lib = await loadCookieLib();
+
+        const response = await biliFetch(`${QR_POLL_URL}?qrcode_key=${encodeURIComponent(key)}`);
+        const setCookies = readSetCookie(response);
+        const payload = await response.json().catch(() => null);
+        if (payload?.code !== 0) {
+            return { ok: false, error: `poll-failed:${payload?.code ?? response.status}` };
+        }
+
+        const data = payload?.data ?? {};
+        const state = Number(data.code);
+        const result = { ok: true, state, message: String(data.message ?? '') };
+        if (state !== 0) return result;
+
+        const fields = new Map();
+        for (const raw of setCookies) {
+            for (const [name, value] of lib.parseCookieHeader(raw.split(';')[0])) fields.set(name, value);
+        }
+        const ticketUrl = String(data.url ?? '');
+        if (!lib.isValidSession(fields) && ticketUrl) {
+            try {
+                // 用浏览器 UA 跟随票据链接，cookie 在这一跳的响应头上
+                const ticketResponse = await biliFetch(ticketUrl);
+                for (const raw of readSetCookie(ticketResponse)) {
+                    for (const [name, value] of lib.parseCookieHeader(raw.split(';')[0])) fields.set(name, value);
+                }
+            } catch (error) {
+                log?.warn?.('ticket follow failed', { message: String(error?.message ?? error) });
+            }
+        }
+        if (!lib.isValidSession(fields)) {
+            for (const [name, value] of cookieFieldsFromTicketUrl(ticketUrl, lib.parseCookieHeader)) {
+                fields.set(name, value);
+            }
+        }
+
+        if (!lib.isValidSession(fields)) {
+            return { ok: false, error: 'login-succeeded-but-no-cookie', state };
+        }
+        await persistCookie(fields);
+        log?.info?.('bilibili login ok', { session: cookieDescription });
+        return { ...result, loggedIn: true, session: lib.describeSession(fields) };
+    };
+
+    /**
+     * 打开一个真正的浏览器窗口走网页登录。
+     *
+     * 为什么不用 folium.ui.embed：那是个 iframe，能不能登录取决于目标页是否允许被嵌套；
+     * 顶层窗口没有这个限制，而且 cookie 直接落进 defaultSession，我们能读。
+     */
+    const openLoginWindow = async () => {
+        let BrowserWindow;
+        let session;
+        try {
+            ({ BrowserWindow, session } = require('electron'));
+        } catch (error) {
+            return { ok: false, error: `electron-unavailable:${String(error?.message ?? error)}` };
+        }
+        if (loginWindow && !loginWindow.isDestroyed()) {
+            loginWindow.focus();
+            return { ok: true, reused: true };
+        }
+
+        const lib = await loadCookieLib();
+        loginWindow = new BrowserWindow({
+            width: 1080,
+            height: 760,
+            title: 'Bilibili 登录',
+            autoHideMenuBar: true,
+        });
+        await loginWindow.loadURL(LOGIN_URL).catch(() => undefined);
+
+        const startedAt = Date.now();
+        const stopPolling = () => {
+            if (loginPoller) clearInterval(loginPoller);
+            loginPoller = null;
+        };
+        loginPoller = setInterval(async () => {
+            if (!loginWindow || loginWindow.isDestroyed() || Date.now() - startedAt > LOGIN_WINDOW_TIMEOUT_MS) {
+                stopPolling();
+                return;
+            }
+            try {
+                const cookies = await session.defaultSession.cookies.get({ domain: 'bilibili.com' });
+                const fields = lib.cookieFieldsFromSession(cookies);
+                if (!lib.isValidSession(fields)) return;
+                await persistCookie(fields);
+                log?.info?.('bilibili web login ok', { session: cookieDescription });
+                stopPolling();
+                if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close();
+            } catch (error) {
+                log?.warn?.('login poll failed', { message: String(error?.message ?? error) });
+            }
+        }, 1500);
+
+        loginWindow.on('closed', () => {
+            stopPolling();
+            loginWindow = null;
+        });
+        return { ok: true };
+    };
+
+    /** 从 Folia 自己的会话里读 cookie（用户可能已经在别处登录过）。 */
+    const readFromSession = async () => {
+        try {
+            const { session } = require('electron');
+            const lib = await loadCookieLib();
+            const cookies = await session.defaultSession.cookies.get({ domain: 'bilibili.com' });
+            const fields = lib.cookieFieldsFromSession(cookies);
+            if (!lib.isValidSession(fields)) return { ok: false, error: 'no-session-cookie' };
+            await persistCookie(fields);
+            log?.info?.('bilibili session imported', { session: cookieDescription });
+            return { ok: true, session: lib.describeSession(fields) };
+        } catch (error) {
+            return { ok: false, error: `read-failed:${String(error?.message ?? error)}` };
+        }
+    };
+
+    const sessionStatus = async () => {
+        const lib = await loadCookieLib();
+        const fields = lib.parseCookieHeader(cookieHeader);
+        return {
+            ok: true,
+            loggedIn: lib.isValidSession(fields),
+            session: lib.describeSession(fields),
+            masked: cookieDescription,
+        };
+    };
+
+    const setCookieFromText = async (text) => {
+        const lib = await loadCookieLib();
+        const fields = lib.parseCookieHeader(text);
+        if (!lib.isValidSession(fields)) return { ok: false, error: 'missing-sessdata' };
+        await persistCookie(fields);
+        log?.info?.('bilibili cookie set manually', { session: cookieDescription });
+        return { ok: true, session: lib.describeSession(fields) };
+    };
+
+    // ------------------------------------------------------------------ 装配
 
     try {
-        // main 入口是用 Node 原生 require 加载的（modSystem.cjs:352），所以 electron 拿得到
         const { session } = require('electron');
         const ses = session?.defaultSession;
         if (!ses?.webRequest?.onBeforeSendHeaders) {
             log?.warn?.('electron session unavailable; Bilibili media will 403 on a non-Bilibili origin');
-            return undefined;
+        } else {
+            const listener = (details, callback) => {
+                if (!isBilibiliCdn(details?.url)) {
+                    callback({ requestHeaders: details?.requestHeaders });
+                    return;
+                }
+                const rewritten = applyBilibiliHeaders(details?.requestHeaders, cookieHeader);
+                callback({ requestHeaders: rewritten ?? details?.requestHeaders });
+            };
+            ses.webRequest.onBeforeSendHeaders({ urls: MEDIA_URL_FILTERS }, listener);
+            detachWebRequest = () => {
+                try {
+                    ses.webRequest.onBeforeSendHeaders({ urls: MEDIA_URL_FILTERS }, null);
+                } catch (error) {
+                    log?.warn?.('failed to detach referer listener', { message: String(error?.message ?? error) });
+                }
+            };
+            log?.info?.('bilibili referer guard installed', { hosts: MEDIA_URL_FILTERS.length });
         }
-
-        const listener = (details, callback) => {
-            // 域名过滤之外再过一道路径判定：akamaized.net 上的非 B 站请求一律不碰
-            if (!isBilibiliCdn(details?.url)) {
-                callback({ requestHeaders: details?.requestHeaders });
-                return;
-            }
-            const rewritten = applyBilibiliReferer(details?.requestHeaders);
-            callback({ requestHeaders: rewritten ?? details?.requestHeaders });
-        };
-
-        ses.webRequest.onBeforeSendHeaders({ urls: MEDIA_URL_FILTERS }, listener);
-
-        detach = () => {
-            try {
-                // 传 null 即为注销该 filter 下的监听器
-                ses.webRequest.onBeforeSendHeaders({ urls: MEDIA_URL_FILTERS }, null);
-            } catch (error) {
-                log?.warn?.('failed to detach referer listener', { message: String(error?.message ?? error) });
-            }
-        };
-
-        log?.info?.('bilibili referer guard installed', { hosts: MEDIA_URL_FILTERS.length });
     } catch (error) {
-        // 装不上也不该让整个模组失效：搜索和歌词还能用，只是音频会 403
         log?.warn?.('failed to install bilibili referer guard', { message: String(error?.message ?? error) });
     }
 
-    return () => detach?.();
+    for (const [name, handler] of Object.entries({
+        'bili.login.create': loginCreate,
+        'bili.login.poll': loginPoll,
+        'bili.login.openWindow': openLoginWindow,
+        'bili.session.read': readFromSession,
+        'bili.session.status': sessionStatus,
+        'bili.session.set': setCookieFromText,
+        'bili.session.clear': async () => {
+            await clearCookie();
+            return { ok: true };
+        },
+    })) {
+        try {
+            api.rpc.handle(name, handler);
+        } catch (error) {
+            log?.warn?.('failed to register rpc', { name, message: String(error?.message ?? error) });
+        }
+    }
+
+    // 启动时把上次存下的登录态装回内存，让 webRequest 监听器立刻能用
+    storageGet(STORAGE_KEY)
+        .then((stored) => (typeof stored === 'string' && stored ? applyCookieHeader(stored) : undefined))
+        .then((fields) => {
+            if (fields) log?.info?.('bilibili session restored', { session: cookieDescription });
+        })
+        .catch(() => undefined);
+
+    return () => {
+        detachWebRequest?.();
+        if (loginPoller) clearInterval(loginPoller);
+        if (loginWindow && !loginWindow.isDestroyed()) loginWindow.close();
+    };
 };
 
 module.exports = activate;
 // 导出给测试用（test/03-contract.mjs）
-module.exports.needsRefererRewrite = needsRefererRewrite;
-module.exports.applyBilibiliReferer = applyBilibiliReferer;
+module.exports.applyBilibiliHeaders = applyBilibiliHeaders;
+module.exports.needsHeaderRewrite = needsHeaderRewrite;
 module.exports.isBilibiliCdn = isBilibiliCdn;
+module.exports.cookieFieldsFromTicketUrl = cookieFieldsFromTicketUrl;
+module.exports.readSetCookie = readSetCookie;
 module.exports.MEDIA_URL_FILTERS = MEDIA_URL_FILTERS;
 module.exports.BILIBILI_REFERER = BILIBILI_REFERER;
