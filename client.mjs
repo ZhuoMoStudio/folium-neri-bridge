@@ -13,6 +13,8 @@
 import { shiftLyricLines } from './lib/lyric-align.mjs';
 import { createWordTimingRelay, planWordTimingInstall } from './lib/word-timing.mjs';
 import { createHttp } from './lib/http.mjs';
+import { formatPartList, probeAudioElement, probeStreamRange, summarizeSelfCheck, summarizeSelfCheckBriefly } from './lib/self-check.mjs';
+import { parseVideoRef } from './lib/bili-video-ref.mjs';
 import { createBilibiliProvider } from './providers/bilibili.mjs';
 import { createAmllBackend } from './providers/lyrics/amll.mjs';
 import { createLrclibBackend } from './providers/lyrics/lrclib.mjs';
@@ -94,9 +96,12 @@ const mountLoginPanel = (folium, container, ctx, refreshProviderSession) => {
             status.textContent = `登录态读取失败：${state?.error ?? 'unknown'}`;
             return;
         }
+        // 音质上限跟着登录态一起显示：以前它只写在日志里，用户看到的是
+        // 「库里明明是 192K 的条目却放不出更高的档」，只会以为是模组的问题。
+        const quality = state.quality?.message;
         status.textContent = state.loggedIn
-            ? `已登录（uid ${state.session?.userId ?? '?'}${state.session?.hasCsrf ? '' : '，缺 bili_jct'}）`
-            : '未登录 — 未登录也能搜索与播放，但部分音质与会员内容不可用';
+            ? `已登录（uid ${state.session?.userId ?? '?'}${state.session?.hasCsrf ? '' : '，缺 bili_jct'}）${quality ? ` · ${quality}` : ''}`
+            : `未登录 — ${quality ?? '未登录也能搜索与播放，但部分音质与会员内容不可用'}`;
     };
 
     const startPolling = () => {
@@ -391,7 +396,133 @@ export default function activate(folium) {
         }
     }
 
+    // ------------------------------------------------------------------ 自检
+    //
+    // 这个命令要回答的，是「无显示器环境里永远验不了」的那几件事（见 lib/self-check.mjs 顶部）。
+    // 主进程侧的事实走 rpc（监听器状态只有那里知道），DOM 侧的探测在这里做。
+    const probeMedia = async (targetId) => {
+        const before = Number((await call(folium, 'bili.diagnose'))?.referer?.rewrites);
+        const stream = await provider.getAudioUrl({ id: targetId, title: '', artists: [] }, 'hires');
+        if (!stream?.url) {
+            return { requestedId: targetId, streamError: 'getAudioUrl 没给出地址（cid 解析不了或取流被拒）' };
+        }
+
+        // 直链 Range：走 folium.net.fetch。它在主进程里用 Node 全局 fetch，
+        // **不经过 Chromium 会话**，所以防护链路的 Referer 改写碰不到它 ——
+        // 这里证明的是「这条直链还活着、CDN 认这个 Range」。
+        const range = await probeStreamRange({
+            url: stream.url,
+            cookie: cookieHeader,
+            fetchImpl: (url, init) => folium.net.fetch(url, init),
+        });
+
+        // <audio>：真正的证明。它走 Chromium 会话，成功就意味着监听器确实生效了。
+        const audio = await probeAudioElement({
+            url: stream.url,
+            createAudio: typeof Audio === 'function' ? () => new Audio() : undefined,
+        });
+
+        const after = Number((await call(folium, 'bili.diagnose'))?.referer?.rewrites);
+        log?.info?.(`${MOD_ID}: self-check media probe`, {
+            song: targetId,
+            range: range.status ?? range.error,
+            audio: audio.outcome,
+            rewrites: `${before} → ${after}`,
+        });
+        return { requestedId: targetId, range, audio, rewritesBefore: before, rewritesAfter: after };
+    };
+
+    const runSelfCheck = async (songId) => {
+        const host = folium.host ?? null;
+        const diagnose = await call(folium, 'bili.diagnose');
+        const session = await call(folium, 'bili.session.status');
+
+        // 探测目标：命令参数优先，否则用当前正在播的那首（当前那首不是本模组的就跳过）
+        let targetId = String(songId ?? '').trim();
+        if (!targetId) {
+            try {
+                const state = folium.playback?.getState?.();
+                const current = state?.song?.id;
+                if (typeof current === 'string' && (current.startsWith(SONG_ID_PREFIX) || current.startsWith(YOUTUBE_SONG_ID_PREFIX))) {
+                    targetId = current;
+                }
+            } catch {
+                // 导出窗口或宿主未就绪时拿不到播放状态，跳过即可
+            }
+        } else {
+            // 允许直接粘 BV 号 / 视频链接：解析成带 cid 的 id 再探测，
+            // 否则 parseSongId 会把链接当成一个奇怪的 bvid
+            const ref = parseVideoRef(targetId);
+            if (ref) targetId = `bili:${ref.bvid}${ref.cid ? `:${ref.cid}` : ''}`;
+        }
+
+        const report = summarizeSelfCheck({
+            host: {
+                folium: host?.folium ?? null,
+                folia: host?.folia ?? null,
+                context: folium.env?.context ?? null,
+                surfaces: { providers: Boolean(omniProviders?.register), hooks: Boolean(omniHooks?.on) },
+            },
+            referer: diagnose?.referer ?? null,
+            session,
+            wordTiming: amll?.stats ? await amll.stats().catch(() => null) : null,
+            media: targetId ? await probeMedia(targetId) : { requestedId: null },
+        });
+        log?.info?.(`${MOD_ID}: self-check`, { result: summarizeSelfCheckBriefly(report) });
+        return report;
+    };
+
     const commands = [
+        {
+            id: 'selfcheck',
+            label: LABEL('Bilibili：自检', 'Bilibili: self-check'),
+            description: LABEL(
+                '检查 Referer 监听器、CDN 直链、登录态与逐字歌词索引。装的模组是不是真在干活，看这一条。',
+                'Checks the Referer listener, a CDN direct link, the session and the word-timing index.',
+            ),
+            keywords: ['bilibili', 'selfcheck', 'diagnose', '自检', '诊断'],
+            params: [
+                {
+                    key: 'songId',
+                    type: 'text',
+                    label: LABEL('要探测的曲目', 'Song to probe'),
+                    description: LABEL(
+                        `留空则用当前正在播的歌。也可以给 BV 号、视频链接或 bili:BV…:cid —— 会取它的直链做 Range 与 <audio> 探测。`,
+                        'Empty uses the current song. A BV id, a video URL or bili:BV...:cid also works.',
+                    ),
+                    placeholder: 'bili:BV1Ps411F7sL:53972318',
+                },
+            ],
+            async run(ctx) {
+                const report = await runSelfCheck(ctx?.values?.songId);
+                return { message: report.message, warnings: report.warnings };
+            },
+        },
+        {
+            id: 'parts',
+            label: LABEL('Bilibili：列出分 P', 'Bilibili: list parts'),
+            description: LABEL(
+                '给一个 BV 号或视频链接，列出它的每个分 P（各自的 id 与时长）。分 P 是独立曲目，粘进搜索框就能点播。',
+                'Lists a video\'s parts with their ids and durations; each part is its own track.',
+            ),
+            keywords: ['bilibili', 'parts', '分P', '合集'],
+            params: [
+                {
+                    key: 'video',
+                    type: 'text',
+                    label: LABEL('BV 号或视频链接', 'BV id or video URL'),
+                    description: LABEL('例如 BV1Ps411F7sL 或 https://www.bilibili.com/video/BV1Ps411F7sL', 'e.g. BV1Ps411F7sL'),
+                    defaultValue: '',
+                    placeholder: 'BV1Ps411F7sL',
+                },
+            ],
+            async run(ctx) {
+                const video = String(ctx?.values?.video ?? '').trim();
+                if (!video) return { message: '先给一个 BV 号或视频链接。' };
+                const page = await provider.search(video, { limit: 50, offset: 0 });
+                return { message: formatPartList(page?.items ?? []) };
+            },
+        },
         {
             id: 'login',
             label: LABEL('Bilibili：登录', 'Bilibili: sign in'),
@@ -408,7 +539,9 @@ export default function activate(folium) {
             async run() {
                 const state = await call(folium, 'bili.session.status');
                 if (!state?.ok) return { message: `读取失败：${state?.error ?? 'unknown'}` };
-                return { message: state.loggedIn ? `已登录，uid ${state.session?.userId ?? '?'}` : '未登录' };
+                const who = state.loggedIn ? `已登录，uid ${state.session?.userId ?? '?'}` : '未登录';
+                // 音质上限是这条命令存在的一半理由：让「未登录所以只有匿名档位」可见
+                return { message: `${who}\n${state.quality?.message ?? ''}`.trim() };
             },
         },
         {
