@@ -2,11 +2,11 @@
   "folium": 1,
   "id": "neri-bridge",
   "name": "NeriPlayer 音源桥",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": "ZhuoMoStudio",
-  "description": "把 Android 端 NeriPlayer 的音源与歌词源接入 Folia：Bilibili 音源（搜索 / 取流）+ LRCLIB 歌词回退。",
+  "description": "Bilibili 音源（搜索 / 取流 / 登录）+ LRCLIB 歌词回退，接进 Folia 的 Folium 模组平台。",
   "main": "index.cjs",
   "client": "client.mjs",
-  "permissions": ["net.fetch"],
+  "permissions": ["net.fetch", "filesystem.data"],
   "experimental": ["omni.providers"]
 }
