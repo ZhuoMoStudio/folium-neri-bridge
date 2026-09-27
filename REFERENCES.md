@@ -12,9 +12,8 @@
 
 | 项目 | 许可 | 移植了什么 |
 | --- | --- | --- |
-| [cwuom/NeriPlayer](https://github.com/cwuom/NeriPlayer) ★3561 | GPL-3.0 | `lib/wbi.mjs`、`lib/lrc.mjs`、`lib/match.mjs`、`providers/bilibili.mjs`、`providers/lyrics/lrclib.mjs` |
-
-逐文件对照在 [NOTICE.md](./NOTICE.md)。`lib/http.mjs`、`lib/bili-cookie.mjs`、`client.mjs`、`index.cjs`、`test/*` 是新写的，不是移植。
+| [cwuom/NeriPlayer](https://github.com/cwuom/NeriPlayer) ★3561 | GPL-3.0 | `lib/wbi.mjs`、`lib/lrc.mjs`、`lib/match.mjs`、`lib/lyric-match.mjs`、`providers/bilibili.mjs`、`providers/lyrics/lrclib.mjs` |
+| [chthollyphile/folia-major](https://github.com/chthollyphile/folia-major) ★3096 | AGPL-3.0 | `lib/ttml.mjs`（词分组规则与 `endsWithSpace` 语义）、`providers/lyrics/amll.mjs`（TTDB 的 URL 形状）。**宿主本身也是 Folia**，逐文件对照在 [NOTICE.md](./NOTICE.md) |
 
 ## B 对照
 
@@ -30,7 +29,8 @@
 
 | 项目 | 许可 | ★ | 用途 |
 | --- | --- | --- | --- |
-| [amll-dev/amll-ttml-db](https://github.com/amll-dev/amll-ttml-db) | **CC0-1.0** | 424 | 逐字 TTML 歌词库。CC0 意味着可以随便用，但它要的不是 LRC，得靠 [#440](https://github.com/chthollyphile/folia-major/issues/440) 之后才有意义 |
+| [amll-dev/amll-ttml-db](https://github.com/amll-dev/amll-ttml-db) | **CC0-1.0** | 424 | 逐字 TTML 歌词库。**运行时的歌词来源**：索引 `metadata/raw-lyrics-index.jsonl`、TTML 原文 `raw-lyrics/*.ttml`、以及官方服务 `amll-ttml-db.stevexmh.net/[平台]/[ID]?format=ttml`。CC0 意味着可以随便用，无任何约束 |
+| [amll-dev/applemusic-like-lyrics](https://github.com/amll-dev/applemusic-like-lyrics) | AGPL-3.0 | 2146 | TTML 逐字歌词的规范来源（与 Folia 同为 AGPL）。词/音节/背景人声的数据模型参照它 |
 | [chenmozhijin/LDDC](https://github.com/chenmozhijin/LDDC) | GPL-3.0 | 1800 | 多平台歌词匹配，手动匹配的交互参考 |
 | [tranxuanthang/lrcget](https://github.com/tranxuanthang/lrcget) | MIT | 3204 | LRCLIB 客户端，看它怎么处理匹配与降级 |
 | [WXRIW/Lyricify-App](https://github.com/WXRIW/Lyricify-App) | 未声明 | 7263 | Windows 歌词工具，逐字渲染参考 |
@@ -39,18 +39,18 @@
 
 | 项目 | 许可 | ★ | 用途 |
 | --- | --- | --- | --- |
-| [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | 193793 | 客户端模拟的通用参考 |
-| [yt-dlp/ejs](https://github.com/yt-dlp/ejs) | Unlicense | 455 | yt-dlp 的外部 JS 签名求解。官方仓库是 `yt-dlp/ejs`，`MorpheApp/ejs`（★2）是同名副本 |
-| [sigma67/ytmusicapi](https://github.com/sigma67/ytmusicapi) | MIT | 3029 | **登录方式的主要参考**：只支持 cookie 认证，需要 `__Secure-3PAPISID` / `SAPISID` / `__Secure-1PSID`，并据此构造 `SAPISIDHASH` 授权头；cookie 会轮换，要从未轮换的会话里导出 |
+| [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense | 193793 | 客户端模拟的通用参考。**「匿名播放需要 PO Token」这个结论与它一致**：现在的 YouTube 网页客户端都得先过 BotGuard |
+| [yt-dlp/ejs](https://github.com/yt-dlp/ejs) | Unlicense | 455 | yt-dlp 的外部 JS 签名求解。官方仓库是 `yt-dlp/ejs`，`MorpheApp/ejs`（★2）是同名副本。**注意它解的是签名挑战，不是 PO Token** —— 本模组卡在后者 |
+| [sigma67/ytmusicapi](https://github.com/sigma67/ytmusicapi) | MIT | 3029 | **请求形状的主要参考**：`context.client` 的字段、`musicResponsiveListItemRenderer` 的结构、`EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D` 这个「只看歌曲」的过滤参数。它也只支持 cookie 认证，需要 `__Secure-3PAPISID` / `SAPISID` / `__Secure-1PSID` 构造 `SAPISIDHASH`；cookie 会轮换，要从未轮换的会话里导出 |
 | [maxrave-dev/SimpMusic](https://github.com/maxrave-dev/SimpMusic) | GPL-3.0 | 11510 | Kotlin 版 YouTube Music 客户端 |
-| [TeamNewPipe/NewPipe](https://github.com/TeamNewPipe/NewPipe) | GPL-3.0 | 39789 | 免 PO Token 的匿名播放路线 |
+| [TeamNewPipe/NewPipe](https://github.com/TeamNewPipe/NewPipe) | GPL-3.0 | 39789 | 免 PO Token 的匿名播放路线（**已失效**，见 README 的实测表） |
 | [MetrolistGroup/Metrolist](https://github.com/MetrolistGroup/Metrolist) | GPL-3.0 | 13024 | 同上，Android |
 
 ### 其它
 
 | 项目 | 许可 | ★ | 用途 |
 | --- | --- | --- | --- |
-| [chaunsin/netease-cloud-music](https://github.com/chaunsin/netease-cloud-music) | MIT | 399 | 网易云接口参考（本项目没移植网易云） |
+| [chaunsin/netease-cloud-music](https://github.com/chaunsin/netease-cloud-music) | MIT | 399 | 网易云接口参考（本项目没移植网易云：它按 NeriPlayer 的做法能反查元数据，但加密较重，从标题与简介提取候选更划算） |
 | [music-assistant/server](https://github.com/music-assistant/server) | Apache-2.0 | 3113 | 多源聚合的登录/降级设计参考 |
 
 ## C 生态
@@ -60,7 +60,6 @@
 | [6xingyv/accompanist-lyrics-ui](https://github.com/6xingyv/accompanist-lyrics-ui) | Apache-2.0 | 152 | NeriPlayer 的逐字歌词组件 |
 | [6xingyv/accompanist-lyrics-core](https://github.com/6xingyv/accompanist-lyrics-core) | Apache-2.0 | 48 | 上一条的解析库 |
 | [cwuom/accompanist-lyrics-ui](https://github.com/cwuom/accompanist-lyrics-ui) | Apache-2.0 | 0 | NeriPlayer 实际编译的 fork |
-| [amll-dev/applemusic-like-lyrics](https://github.com/amll-dev/applemusic-like-lyrics) | AGPL-3.0 | 2146 | 上面两套的源头。TTML 逐字歌词的规范来源，与 Folia 同为 AGPL |
 | [ReChronoRain/HyperCeiler](https://github.com/ReChronoRain/HyperCeiler) | AGPL-3.0 | 5445 | NeriPlayer 的界面灵感来源，与本仓库无关 |
 
 ## ⚠️ bilibili-API-collect 已关停
