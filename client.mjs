@@ -1,19 +1,34 @@
 // client.mjs
 //
-// 模组的渲染端入口。注册三样东西：
+// 模组的渲染端入口。注册四样东西：
 //   - 音源（通过实验接口 omni.providers，不在 registries 下）
-//   - 一个设置面板，管 B 站登录态
+//   - 逐字歌词的 omni.lyricsResolved 钩子（实验接口 omni.hooks）
+//   - 两个设置面板，管 B 站登录态与音源开关
 //   - 几个命令，方便从命令面板直接触发
 //
 // 登录态只有一份，存在主进程侧的 storage 里（与 main 入口共用同一个数据文件）。
 // 渲染端只读它，用来给请求带 Cookie；真正的读写都由 main 入口做，
 // 因为只有 Node 侧的 headers.getSetCookie() 能可靠拿到多个 Set-Cookie。
 
+import { shiftLyricLines } from './lib/lyric-align.mjs';
+import { createWordTimingRelay, planWordTimingInstall } from './lib/word-timing.mjs';
 import { createHttp } from './lib/http.mjs';
 import { createBilibiliProvider } from './providers/bilibili.mjs';
+import { createAmllBackend } from './providers/lyrics/amll.mjs';
 import { createLrclibBackend } from './providers/lyrics/lrclib.mjs';
+import { createYoutubeProvider } from './providers/youtube.mjs';
 
 const MOD_ID = 'neri-bridge';
+const BILIBILI_PROVIDER_NAME = 'bilibili';
+/**
+ * 宿主给外部 provider 的 id 前缀。
+ * `omniProviders.ts` 的 `foliumProviderId(id) = `folium.${id.replace(':', '.')}``，
+ * 而注册用的是 `neri-bridge:bilibili`，所以这里的 providerId 是 `folium.neri-bridge.bilibili`。
+ * 注册句柄的 `id` 是 `neri-bridge:bilibili`（没有 folium. 前缀），别拿它来比。
+ */
+const BILIBILI_PROVIDER_ID = `folium.${MOD_ID}.${BILIBILI_PROVIDER_NAME}`;
+const SONG_ID_PREFIX = 'bili:';
+const YOUTUBE_SONG_ID_PREFIX = 'yt:';
 const COOKIE_STORAGE_KEY = 'bilibiliCookie';
 const LOGIN_WINDOW_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -122,7 +137,8 @@ const mountLoginPanel = (folium, container, ctx, refreshProviderSession) => {
             await refreshProviderSession();
             await render();
             toast(folium, '已导入登录态', 'success');
-        }),        button('应用粘贴内容', async () => {
+        }),
+        button('应用粘贴内容', async () => {
             const text = paste.value.trim();
             if (!text) {
                 toast(folium, '先粘贴 Cookie', 'error');
@@ -197,15 +213,113 @@ export default function activate(folium) {
 
     const http = createHttp(folium, log);
     const lrclib = createLrclibBackend(http);
-    const provider = createBilibiliProvider({ http, lrclib, log, getCookie: () => cookieHeader });
+
+    // ------------------------------------------------------------ 逐字歌词
+    //
+    // 分两半，中间靠 relay 传递，原因是宿主的时间预算：
+    //   - provider 的 getLyrics：没有预算限制，**联网取 TTML 在这一步做完**；
+    //   - omni.lyricsResolved 钩子：每个处理器只有 1500ms（events.ts 的 ASYNC_TIMEOUT_MS），
+    //     超时后对 event.lines 的赋值不再生效 —— 所以钩子里只做内存查表与换算。
+    //
+    // omni.hooks 是实验接口，没声明就拿不到；拿不到时整个逐字链路降级掉（不报错），
+    // LRC 回退照常工作。
+    const amll = createAmllBackend({ http, log, storage: folium.storage });
+    const wordTimingRelay = createWordTimingRelay();
+    const omniHooks = folium.experimental?.['omni.hooks'];
+    const wordTiming = omniHooks?.on
+        ? {
+            /** 预热索引：在取流时顺手触发，和播放启动的耗时重叠。 */
+            warm() {
+                void amll.warm();
+            },
+            /** 取逐字歌词并放进 relay。查不到也记一条空条目，钩子那边就不再重复问。 */
+            async prepare({ key, title, artists, durationMs }) {
+                if (!key) return;
+                const found = await amll.lookup({ title, artists, durationMs });
+                wordTimingRelay.put(
+                    key,
+                    found
+                        ? // titleScore 也带上：钩子在「没有参照时轴」的情况下要用它判断
+                          // 这份逐字歌词是否可信（见 lib/word-timing.mjs 里的规则）
+                          { lines: found.lines, source: found.source, titleScore: found.titleScore }
+                        : { lines: [] },
+                );
+            },
+        }
+        : null;
+
+    const provider = createBilibiliProvider({
+        http,
+        lrclib,
+        log,
+        getCookie: () => cookieHeader,
+        wordTiming,
+    });
 
     const disposers = [];
     const handle = omniProviders.register(provider);
     log?.info?.(`${MOD_ID}: registered provider ${handle?.id ?? provider.id}`);
 
+    if (wordTiming) {
+        try {
+            const disposeHook = omniHooks.on('lyricsResolved', (event) => {
+                const songId = typeof event?.song?.id === 'string' ? event.song.id : '';
+                // 只处理本模组的歌：其它来源（本地、内置在线源）的歌词不归这里管。
+                // source 是宿主加的 `folium.<modid>.<name>`，id 前缀则是我们自己拼的，两重都认。
+                const isOurs =
+                    event?.song?.source === BILIBILI_PROVIDER_ID ||
+                    songId.startsWith(SONG_ID_PREFIX) ||
+                    songId.startsWith(YOUTUBE_SONG_ID_PREFIX);
+                if (!isOurs) return;
+
+                const cached = wordTimingRelay.take(songId);
+                if (!cached?.lines?.length) return;
+
+                // 宿主可能已经给了逐字（例如别的模组先动过手），那就别覆盖
+                const alreadyWordTimed = (Array.isArray(event.lines) ? event.lines : []).some((line) =>
+                    (line?.words ?? []).some((word) => (word?.syllables?.length ?? 0) > 1),
+                );
+                if (alreadyWordTimed) return;
+
+                // 装不装、偏多少，全交给这个纯函数判（规则与理由见 lib/word-timing.mjs）
+                const plan = planWordTimingInstall({
+                    referenceLines: event.lines,
+                    candidateLines: cached.lines,
+                    titleScore: cached.titleScore ?? 0,
+                });
+                if (!plan.install) {
+                    log?.info?.(`${MOD_ID}: word-by-word lyrics skipped`, {
+                        reason: plan.reason,
+                        referenceLines: Array.isArray(event.lines) ? event.lines.length : 0,
+                        candidateLines: cached.lines.length,
+                        titleScore: cached.titleScore ?? 0,
+                    });
+                    return;
+                }
+
+                event.lines = shiftLyricLines(cached.lines, plan.offset ?? 0);
+                log?.info?.(`${MOD_ID}: word-by-word lyrics installed`, {
+                    lines: event.lines.length,
+                    offsetMs: Math.round((plan.offset ?? 0) * 1000),
+                    aligned: plan.aligned === true,
+                    titleScore: cached.titleScore ?? 0,
+                    source: cached.source,
+                });
+            });
+            disposers.push(() => disposeHook?.());
+        } catch (error) {
+            log?.warn?.('failed to register the omni.lyricsResolved hook', { message: String(error?.message ?? error) });
+        }
+    } else {
+        log?.warn?.('omni.hooks is unavailable; word-by-word lyrics are disabled (LRC fallback still works)');
+    }
+
     // 启动时先把登录态读进来，免得第一首歌漏带 Cookie
     refreshProviderSession();
 
+    /** 设置分区。两个：登录一个、音源开关一个。注册句柄的 params 能直接读值。 */
+    /** @type {{ params?: { get?: () => Record<string, unknown> } } | null} */
+    let sourcesSection = null;
     try {
         const section = folium.registries.settingsSections.register({
             id: 'bilibili-login',
@@ -232,6 +346,49 @@ export default function activate(folium) {
         disposers.push(() => section?.unregister?.());
     } catch (error) {
         log?.warn?.('failed to register settings section', { message: String(error?.message ?? error) });
+    }
+
+    try {
+        sourcesSection = folium.registries.settingsSections.register({
+            id: 'sources',
+            label: LABEL('音源', 'Sources'),
+            description: LABEL(
+                '逐字歌词与额外音源的开关。Bilibili 逐字歌词来自 AMLL TTDB（CC0）。',
+                'Word-by-word lyrics and extra sources. Bilibili word timing comes from AMLL TTDB (CC0).',
+            ),
+            settings: [
+                {
+                    key: 'enableYoutube',
+                    type: 'boolean',
+                    label: LABEL('启用 YouTube Music 搜索', 'Enable YouTube Music search'),
+                    description: LABEL(
+                        '只提供搜索与元数据：匿名 InnerTube 拿不到播放地址（需要 PO Token），所以这些歌放不了。默认关闭。改动需要重新启用模组才生效。',
+                        'Search and metadata only: anonymous InnerTube returns no playback URL (PO Token required), so these songs cannot play. Off by default; re-enable the mod after changing.',
+                    ),
+                    defaultValue: false,
+                },
+            ],
+        });
+        disposers.push(() => sourcesSection?.unregister?.());
+    } catch (error) {
+        log?.warn?.('failed to register the sources settings section', { message: String(error?.message ?? error) });
+    }
+
+    // YouTube Music：匿名 InnerTube 搜索可用、匿名播放不可用（见 providers/youtube.mjs
+    // 顶部的实测记录）。所以这个 provider 只声明 search / getSong / getLyrics，不声明播放，
+    // 而且默认关闭 —— 一个放不了的音源出现在选择器里只会让人以为坏了。
+    const youtubeEnabled = sourcesSection?.params?.get?.()?.enableYoutube === true;
+    if (!youtubeEnabled) {
+        log?.info?.(`${MOD_ID}: YouTube Music search is off (enable it in the mod settings)`);
+    } else {
+        try {
+            const youtube = createYoutubeProvider({ http, log, wordTiming });
+            const youtubeHandle = omniProviders.register(youtube);
+            log?.info?.(`${MOD_ID}: registered provider ${youtubeHandle?.id ?? youtube.id}`);
+            disposers.push(() => youtubeHandle?.unregister?.());
+        } catch (error) {
+            log?.warn?.('failed to register the YouTube provider', { message: String(error?.message ?? error) });
+        }
     }
 
     const commands = [
