@@ -1,0 +1,18 @@
+{
+    "note": "2026-08 之前的老形状：data.url 的查询串里直接带着 cookie，没有任何 Set-Cookie。三条路里走第三条。",
+    "kind": "legacy",
+    "capturedAt": "synthetic",
+    "pollSetCookies": [],
+    "ticketUrl": "https://passport.bilibili.com/login?SESSDATA=FAKE_SESSDATA_FOR_TESTS&bili_jct=FAKE_CSRF_FOR_TESTS&DedeUserID=4242424242&gourl=https%3A%2F%2Fwww.bilibili.com",
+    "ticketSetCookies": [],
+    "expect": {
+        "followTicket": true,
+        "hasSession": true,
+        "routes": ["legacy-query"],
+        "fields": {
+            "SESSDATA": "FAKE_SESSDATA_FOR_TESTS",
+            "bili_jct": "FAKE_CSRF_FOR_TESTS",
+            "DedeUserID": "4242424242"
+        }
+    }
+}

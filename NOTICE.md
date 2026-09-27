@@ -30,12 +30,16 @@ https://github.com/cwuom/NeriPlayer
 | `lib/ttml.mjs` | `src/utils/lyrics/enhancedLrcSerializer.ts` | `words` 拼接 === `fullText` 这条不变量（决定空格落在哪个词上） |
 | `providers/lyrics/amll.mjs` | `src/utils/lyrics/providers/amllDbProvider.ts` | TTDB 服务的 URL 形状与 `?format=ttml` 参数 |
 | `lib/word-timing.mjs`、`client.mjs` 的钩子 | `src/mods/folium/events.ts`、`dto.ts`、`experimental.ts` | `ASYNC_TIMEOUT_MS = 1500` 这个预算，以及 `fromFoliumLines` 会重建行（`renderHints` 由宿主重算） |
+| `lib/self-check.mjs` | `electron/modSystem/modSystem.cjs`（`invokeModNetFetch`） | `folium.net.fetch` 在 Node 侧、有 5MB 响应体上限、不经过 Chromium 会话 —— 决定了两条探测各证明什么 |
+| `client.mjs` 的多分 P 入口 | `src/mods/folium/dto.ts`（`resolveFoliumSongRef`） | `playSong` 只认宿主自己发出去的 ref，所以分 P 只能从 `search` 递出去 |
 
 Folia 是 AGPL-3.0，与本仓库同一许可族，组合没有额外义务。这里是「照语义重写」而不是逐行复制 —— 模组的 client 入口不能 import 裸模块名，也拿不到宿主的打包产物。
 
 ## 新写的（不是移植）
 
-`lib/http.mjs`、`lib/bili-cookie.mjs`、`lib/artist-candidates.mjs`、`lib/amll-index.mjs`、`lib/lyric-align.mjs`、`lib/word-timing.mjs`、`lib/ttml.mjs`、`providers/youtube.mjs`、`client.mjs`、`index.cjs`、`test/*`。
+`lib/http.mjs`、`lib/bili-cookie.mjs`、`lib/bili-login.cjs`、`lib/bili-video-ref.mjs`、`lib/artist-candidates.mjs`、`lib/amll-index.mjs`、`lib/lyric-align.mjs`、`lib/word-timing.mjs`、`lib/self-check.mjs`、`lib/ttml.mjs`、`providers/youtube.mjs`、`client.mjs`、`index.cjs`、`test/*`。
+
+`test/fixtures/*.json` 是**合成样本**（值全是 `FAKE_…_FOR_TESTS` 占位符），不是抓包，见 [`test/fixtures/CAPTURE.md`](./test/fixtures/CAPTURE.md)。
 
 ## 宿主
 
