@@ -1,10 +1,11 @@
-// test/10-selfcheck.mjs —— 不联网。三件事的离线回归：
+// test/10-selfcheck.mjs —— 不联网。四件事的离线回归：
 //
 //   1. 多 P 的入口判定（lib/bili-video-ref.mjs）：什么算「用户要这个视频」；
 //   2. 扫码成功后的凭据来源（lib/bili-login.cjs）：三条路 + 样本脱敏断言；
-//   3. 自检命令的结论与格式化（lib/self-check.mjs）：含假 DOM 与假 fetcher 的探测。
+//   3. 自检命令的结论与格式化（lib/self-check.mjs）：含假 DOM 与假 fetcher 的探测；
+//   4. provider 的分 P 逻辑（providers/bilibili.mjs）：假取数层，不联网。
 //
-// 为什么这三件放在一起：它们都是「真 Folia 里才能确认」或「真手机扫码才能拿到」的东西，
+// 为什么这些放在一起：它们都是「真 Folia 里才能确认」或「真手机扫码才能拿到」的东西，
 // 唯独逻辑部分可以在沙盒里钉死。钉不住的部分写在 VERIFY.md 里交给人工。
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -374,6 +375,174 @@ console.log('\n== 8. formatPartList：把分 P 列成可读的东西 ==');
     check('超出上限时截断并交代还有多少', /只列前 5 个/.test(many) && /另有 25 个/.test(many));
     check('空列表给一句人话', /没拿到分 P/.test(formatPartList([])));
     check('非数组不炸', /没拿到分 P/.test(formatPartList(null)));
+}
+
+// ------------------------------------------------- 9. provider 的分 P 逻辑
+console.log('\n== 9. providers/bilibili.mjs：分 P 的解析与标题（假取数层，不联网）==');
+
+/**
+ * 假的取数层。provider 只用到 `http.json`，所以按 pathname 回固定 payload 就够。
+ * WBI 签名、cid 解析、分 P 定位、标题拼装全是真代码 —— 被替换掉的只有「谁去发这个请求」。
+ * 联网那份在同名逻辑上另有覆盖（test/02-live.mjs 第 3b 节，用真实多 P 稿件）。
+ */
+const createFakeBiliHttp = () => {
+    const paths = [];
+    const urls = [];
+    const MULTI = 'BV1Ps411F7sL';
+    const SINGLE = 'BV1bt4y1F7JM';
+    const MULTI_PAGES = [
+        { cid: 11, part: 'P1-序曲', duration: 100 },
+        { cid: 22, part: 'P2-主题', duration: 200 },
+        { cid: 33, part: 'P3-尾声', duration: 300 },
+    ];
+    const SINGLE_PAGES = [{ cid: 866382027, part: '纯音乐《Inspire》，请欣赏～', duration: 220 }];
+
+    const json = async (url) => {
+        const parsed = new URL(url);
+        paths.push(parsed.pathname);
+        urls.push(parsed);
+        const path = parsed.pathname;
+
+        if (path.endsWith('/x/web-interface/nav')) {
+            return {
+                code: 0,
+                data: {
+                    wbi_img: {
+                        img_url: 'https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png',
+                        sub_url: 'https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png',
+                    },
+                },
+            };
+        }
+        if (path.endsWith('/x/web-interface/wbi/search/type')) {
+            return {
+                code: 0,
+                data: {
+                    result: [{ type: 'video', bvid: SINGLE, title: '纯音乐《Inspire》', author: 'UP主', duration: '3:40' }],
+                    numPages: 1,
+                    numResults: 1,
+                },
+            };
+        }
+        if (path.endsWith('/x/player/pagelist')) {
+            const bvid = parsed.searchParams.get('bvid');
+            if (bvid === MULTI) return { code: 0, data: MULTI_PAGES };
+            if (bvid === SINGLE) return { code: 0, data: SINGLE_PAGES };
+            return { code: -404, message: '什么都没有' };
+        }
+        if (path.endsWith('/x/web-interface/wbi/view')) {
+            const bvid = parsed.searchParams.get('bvid');
+            if (bvid === MULTI) {
+                return {
+                    code: 0,
+                    data: {
+                        title: '合集名',
+                        desc: '',
+                        owner: { name: 'UP主' },
+                        pic: '//i0.hdslb.com/a.jpg',
+                        duration: 600,
+                        pages: [{ part: MULTI_PAGES[0].part }],
+                    },
+                };
+            }
+            if (bvid === SINGLE) {
+                return { code: 0, data: { title: '纯音乐《Inspire》', desc: '', owner: { name: 'UP主' }, duration: 220, pages: [{ part: SINGLE_PAGES[0].part }] } };
+            }
+            return { code: -404, message: 'view 拿不到' };
+        }
+        if (path.endsWith('/x/player/wbi/playurl')) {
+            return {
+                code: 0,
+                data: {
+                    dash: {
+                        audio: [
+                            {
+                                id: 30280,
+                                baseUrl: 'https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/x.m4s?deadline=1790481594',
+                                bandwidth: 320000,
+                            },
+                        ],
+                    },
+                },
+            };
+        }
+        return null;
+    };
+
+    return { json, paths, urls, MULTI, SINGLE };
+};
+
+{
+    const { createBilibiliProvider } = await import('../providers/bilibili.mjs');
+    const fake = createFakeBiliHttp();
+    const quiet = { info: () => {}, warn: () => {}, error: () => {} };
+    const provider = createBilibiliProvider({ http: fake, lrclib: null, log: quiet, getCookie: () => '' });
+
+    const listed = await provider.search(fake.MULTI, { limit: 20, offset: 0 });
+    const parts = listed.items;
+    check('按 BV 搜索返回每个分 P 一条', parts.length === 3, JSON.stringify(parts.map((item) => item.id)));
+    check(
+        '分 P 的 id 各自带自己的 cid',
+        parts.map((item) => item.id).join('|') === `bili:${fake.MULTI}:11|bili:${fake.MULTI}:22|bili:${fake.MULTI}:33`,
+        JSON.stringify(parts.map((item) => item.id)),
+    );
+    check(
+        '每个分 P 用自己的时长（不是一律拿第一个的）',
+        parts.map((item) => item.durationMs).join(',') === '100000,200000,300000',
+        JSON.stringify(parts.map((item) => item.durationMs)),
+    );
+    check(
+        '多 P 时标题拼上分 P 名',
+        parts[1]?.title === '合集名 - P2-主题',
+        JSON.stringify(parts.map((item) => item.title)),
+    );
+    check('分 P 列表不分页（hasMore 为 false）', listed.hasMore === false);
+
+    const byCid = await provider.search(`bili:${fake.MULTI}:22`, { limit: 20, offset: 0 });
+    check('给 cid 就只返回那一个分 P', byCid.items.length === 1 && byCid.items[0].id === `bili:${fake.MULTI}:22`, JSON.stringify(byCid.items.map((item) => item.id)));
+
+    const byPage = await provider.search(`https://www.bilibili.com/video/${fake.MULTI}?p=3`, { limit: 20, offset: 0 });
+    check('?p=3 只返回第 3 个分 P', byPage.items.length === 1 && byPage.items[0].id === `bili:${fake.MULTI}:33`, JSON.stringify(byPage.items.map((item) => item.id)));
+
+    // 关键词不能被劫走：必须打到搜索接口，而不是 pagelist
+    const keywordPathStart = fake.paths.length;
+    const keywordPage = await provider.search('夜に駆ける', { limit: 20, offset: 0 });
+    const keywordPaths = fake.paths.slice(keywordPathStart);
+    check('关键词走搜索接口（不是被当成 BV 号）', keywordPaths.some((path) => path.endsWith('/wbi/search/type')), keywordPaths.join(','));
+    check('关键词搜索的结果照常返回', keywordPage.items.length === 1 && keywordPage.items[0].id === `bili:${fake.SINGLE}`, JSON.stringify(keywordPage.items));
+
+    const partTwo = await provider.getSong(`bili:${fake.MULTI}:22`);
+    check('getSong 按 cid 给出那一个分 P', partTwo?.id === `bili:${fake.MULTI}:22`, String(partTwo?.id));
+    check('getSong 的标题带分 P 名', partTwo?.title === '合集名 - P2-主题', String(partTwo?.title));
+    check('getSong 的时长是这个分 P 的', partTwo?.durationMs === 200_000, String(partTwo?.durationMs));
+
+    const firstPart = await provider.getSong(`bili:${fake.MULTI}`);
+    check('id 不带 cid 时取第一个分 P', firstPart?.id === `bili:${fake.MULTI}:11`, String(firstPart?.id));
+
+    // cid 不在列表里（旧的收藏、已删的分 P）：元数据拿不到，但不能变成「不可播放」
+    const stale = await provider.getSong(`bili:${fake.MULTI}:9999`);
+    check('cid 不在分 P 列表里时不返回 null', Boolean(stale?.id), JSON.stringify(stale));
+    check('那个 id 仍然带着原来的 cid（取流只认它）', stale?.id === `bili:${fake.MULTI}:9999`, String(stale?.id));
+    check('拿不到分 P 名时标题退回稿件标题', stale?.title === '合集名', String(stale?.title));
+    check('拿不到分 P 时长时退回稿件总时长', stale?.durationMs === 600_000, String(stale?.durationMs));
+
+    const single = await provider.getSong(`bili:${fake.SINGLE}`);
+    check('单 P 视频的标题不拼分 P 名', single?.title === '纯音乐《Inspire》', String(single?.title));
+
+    // 分 P 缓存：同一个 bvid 被上面问了 6 次，pagelist 只该发一次
+    const pagelistCalls = fake.paths.filter((path) => path.endsWith('/x/player/pagelist')).length;
+    check('每个 bvid 的分 P 列表只请求一次（两个 bvid 共 2 次）', pagelistCalls === 2, `pagelist 请求 ${pagelistCalls} 次`);
+
+    const audioForPart = await provider.getAudioUrl({ id: `bili:${fake.MULTI}:33` }, 'high');
+    check('按分 P 的 cid 取流', typeof audioForPart?.url === 'string', String(audioForPart?.url));
+    const playCall = fake.urls.filter((url) => url.pathname.endsWith('/x/player/wbi/playurl')).pop();
+    check(
+        '取流时把那个分 P 的 cid 传下去了',
+        playCall?.searchParams.get('cid') === '33',
+        `cid=${playCall?.searchParams.get('cid')}`,
+    );
+    check('取流带 fnval=16（DASH 才有纯音频流）', playCall?.searchParams.get('fnval') === '16');
+    check('从直链 deadline 解出 expiresAt', audioForPart?.expiresAt === 1790481594000, String(audioForPart?.expiresAt));
 }
 
 process.exit(summary() === 0 ? 0 : 1);
