@@ -1,0 +1,26 @@
+{
+    "note": "2026-08 起的 crossDomain 形状：poll 自身只下了个 buvid3，真正的会话凭据由跟随 data.url 那一跳的 Set-Cookie 下发。三条路里走第二条。",
+    "kind": "crossdomain",
+    "capturedAt": "synthetic",
+    "pollSetCookies": [
+        "buvid3=FAKE_BUVID3_FOR_TESTS; Path=/; Domain=.bilibili.com; Expires=Thu, 01 Jan 2027 00:00:00 GMT"
+    ],
+    "ticketUrl": "https://passport.biligame.com/crossDomain?DedeUserID=&DedeUserID__ckMd5=&Expires=1790481594&gourl=https%3A%2F%2Fwww.bilibili.com",
+    "ticketSetCookies": [
+        "SESSDATA=FAKE_SESSDATA_FOR_TESTS; Path=/; Domain=.bilibili.com; Expires=Thu, 01 Jan 2027 00:00:00 GMT; HttpOnly",
+        "bili_jct=FAKE_CSRF_FOR_TESTS; Path=/; Domain=.bilibili.com; Expires=Thu, 01 Jan 2027 00:00:00 GMT",
+        "DedeUserID=4242424242; Path=/; Domain=.bilibili.com; Expires=Thu, 01 Jan 2027 00:00:00 GMT",
+        "DedeUserID__ckMd5=FAKE_CKMD5_FOR_TESTS; Path=/; Domain=.bilibili.com; Expires=Thu, 01 Jan 2027 00:00:00 GMT",
+        "sid=FAKE_SID_FOR_TESTS; Path=/; Domain=.bilibili.com; Expires=Thu, 01 Jan 2027 00:00:00 GMT"
+    ],
+    "expect": {
+        "followTicket": true,
+        "hasSession": true,
+        "routes": ["ticket-set-cookie"],
+        "fields": {
+            "SESSDATA": "FAKE_SESSDATA_FOR_TESTS",
+            "bili_jct": "FAKE_CSRF_FOR_TESTS",
+            "DedeUserID": "4242424242"
+        }
+    }
+}
