@@ -30,6 +30,7 @@ import {
     artistCandidatesFromTitle,
     extractArtistCandidates,
 } from '../lib/artist-candidates.mjs';
+import { createLrclibBackend } from '../providers/lyrics/lrclib.mjs';
 
 console.log('\n== lib/md5.mjs：RFC 1321 标准测试向量 ==');
 check('md5("")', md5('') === 'd41d8cd98f00b204e9800998ecf8427e', md5(''));
@@ -327,5 +328,91 @@ check('「Ayase-YOASOBI」两边都留下', (() => {
     const candidates = artistCandidatesFromTitle('Ayase-YOASOBI');
     return candidates.includes('Ayase') && candidates.includes('YOASOBI');
 })());
+
+console.log('\n== providers/lyrics/lrclib.mjs：多候选与关键词兜底 ==');
+// 候选艺术家是从 B 站标题/简介里猜的，可能是错的。用错的那个去拼搜索关键词，
+// 原本能命中的歌会一条都搜不出来 —— 实测在真实网络上就是这样丢的。
+const createLrclibHttp = (handler) => {
+    const calls = [];
+    return {
+        calls,
+        json: async (url, init) => {
+            calls.push(url);
+            return handler(url, init);
+        },
+    };
+};
+const synced = (trackName, artistName, duration = 259) => ({
+    trackName,
+    artistName,
+    duration,
+    syncedLyrics: '[00:01.00]第一行歌词\n[00:12.00]第二行歌词',
+    plainLyrics: '第一行歌词\n第二行歌词',
+});
+
+const fallbackHttp = createLrclibHttp((url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith('/get')) return null;
+    if (parsed.pathname.endsWith('/search')) {
+        // 带坏候选的关键词搜不到；纯标题能搜到
+        return parsed.searchParams.get('q').includes('坏候选') ? [] : [synced('夜に駆ける', 'YOASOBI')];
+    }
+    return null;
+});
+const fallbackHit = await createLrclibBackend(fallbackHttp).lookup({
+    title: '夜に駆ける',
+    artists: ['坏候选', 'YOASOBI'],
+    durationMs: 259_000,
+    relaxedDuration: true,
+});
+const searchKeywords = fallbackHttp.calls
+    .filter((url) => url.includes('/search'))
+    .map((url) => new URL(url).searchParams.get('q'));
+check('第一个候选搜不到时会退到纯标题搜索', Boolean(fallbackHit?.lrc), JSON.stringify(fallbackHit));
+check(
+    '两次关键词的顺序是「标题+首个候选」→「纯标题」',
+    searchKeywords.length === 2 && searchKeywords[0].includes('坏候选') && searchKeywords[1] === '夜に駆ける',
+    JSON.stringify(searchKeywords),
+);
+
+// 退到纯标题不等于放宽身份判定：艺术家对不上的候选仍然要被挡掉
+const strictHttp = createLrclibHttp((url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith('/get')) return null;
+    if (parsed.pathname.endsWith('/search')) return [synced('夜に駆ける', '完全不相干的歌手')];
+    return null;
+});
+const strictHit = await createLrclibBackend(strictHttp).lookup({
+    title: '夜に駆ける',
+    artists: ['YOASOBI'],
+    durationMs: 259_000,
+    relaxedDuration: true,
+});
+check('退到纯标题后仍然按全部候选做艺术家判定', strictHit === null);
+
+// 第一个候选就能命中时不该多发第二次搜索
+const directHttp = createLrclibHttp((url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith('/get')) return null;
+    if (parsed.pathname.endsWith('/search')) return [synced('夜に駆ける', 'YOASOBI')];
+    return null;
+});
+const directHit = await createLrclibBackend(directHttp).lookup({
+    title: '夜に駆ける',
+    artists: ['YOASOBI'],
+    durationMs: 259_000,
+    relaxedDuration: true,
+});
+check('首候选就命中时只发一次搜索（关键词里没有艺术家就只搜一次）', Boolean(directHit?.lrc) && directHttp.calls.filter((url) => url.includes('/search')).length === 1, String(directHttp.calls.length));
+
+// 精确接口命中时不该走搜索
+const exactHttp = createLrclibHttp((url) => (url.includes('/get') ? synced('夜に駆ける', 'YOASOBI') : []));
+const exactHit = await createLrclibBackend(exactHttp).lookup({
+    title: '夜に駆ける',
+    artists: ['YOASOBI'],
+    durationMs: 259_000,
+    relaxedDuration: true,
+});
+check('精确接口命中时不再搜索', Boolean(exactHit?.lrc) && !exactHttp.calls.some((url) => url.includes('/search')), JSON.stringify(exactHttp.calls.map((u) => new URL(u).pathname)));
 
 process.exit(summary() === 0 ? 0 : 1);
