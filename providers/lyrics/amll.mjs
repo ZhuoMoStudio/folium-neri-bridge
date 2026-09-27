@@ -196,6 +196,35 @@ export const createAmllBackend = ({ http, log, storage }) => {
         },
 
         /**
+         * 自检用的索引状态。**不联网**：自检不该顺带拉 1.6MB 索引。
+         *
+         * `bytes` 是紧凑索引的 JSON 长度，也就是写进模组数据文件的大致体积
+         * （数据文件上限 1MB，实测 453KB）—— 只有真写进去过才拿得到，
+         * 所以内存里刚拉完但还没落盘时它会是 0。
+         */
+        async stats() {
+            const format = await storageGet(STORAGE_FORMAT_KEY);
+            const fetchedAt = Number(await storageGet(STORAGE_INDEX_AT_KEY));
+            const ageMs = Number.isFinite(fetchedAt) && fetchedAt > 0 ? Date.now() - fetchedAt : null;
+            const stored = await storageGet(STORAGE_INDEX_KEY);
+            const bytes = Array.isArray(stored) ? JSON.stringify(stored).length : 0;
+            const base = { bytes, ageMs, format: format ?? null };
+
+            if (Array.isArray(index) && index.length > 0) {
+                return { available: true, entries: index.length, source: 'memory', ...base };
+            }
+            const entries = expandAmllIndex(stored);
+            if (entries.length === 0) return { available: false, entries: 0, source: 'none', ...base };
+            return {
+                available: true,
+                entries: entries.length,
+                source: 'storage',
+                stale: Number.isFinite(ageMs) && ageMs > INDEX_TTL_MS,
+                ...base,
+            };
+        },
+
+        /**
          * 找一份逐字歌词。
          *
          * @param query.title      歌名（调用方已清洗）
