@@ -4,6 +4,7 @@
 
 - 上游议题：[folia-major#440 — omni.providers 透传逐字歌词 wordByWordText](https://github.com/chthollyphile/folia-major/issues/440)
 - 模组 id：`neri-bridge`
+- 上游项目与许可证清单：[REFERENCES.md](./REFERENCES.md)
 
 ---
 
@@ -34,14 +35,16 @@ npm run test:live  # 02-live，打真实 B 站与 LRCLIB
 npm run test:cdn   # 04-cdn，采样 CDN 域名并测防盗链策略
 ```
 
-最近一次结果（Node 22.14.0，2026-09-27）：
+最近一次结果（从 GitHub 重新克隆后跑的，Node 22.14.0，2026-09-27）：
 
 | 套件 | 结果 | 覆盖 |
 | --- | --- | --- |
 | `01-offline` | **33 / 33** | MD5 的 RFC 1321 向量、LRC 塌缩时间轴、歌名/艺术家归一化、时长容差边界 |
-| `02-live` | **15 / 15** | 真实 B 站搜索、WBI 缓存、pagelist 取 cid、DASH 取流、CDN 请求头、LRCLIB |
+| `02-live` | **16 / 16** | 真实 B 站搜索、WBI 缓存、pagelist 取 cid、DASH 取流、CDN 请求头、LRCLIB |
 | `03-contract` | **47 / 47** | 用 **Folia 自己的 `validateManifest`** 校验清单；Referer 判定；打桩宿主端到端跑 `client.mjs` |
 | `04-cdn` | **10 / 10** | 两个 CDN 家族的防盗链策略采样 |
+
+合计 106 项，0 失败。
 
 仍然**没有覆盖**的只剩一件事：模组被 Folia 真正加载后，宿主 UI 里能不能搜到、点开能不能出声。这需要在装有 Folia 的机器上跑一次。
 
@@ -159,8 +162,25 @@ NeriPlayer 的完整匹配策略在 `EditableLyricMatchPolicy.kt`（约 480 行�
 
 ---
 
+## 第三方接口的合规说明
+
+**这一节请连同 [REFERENCES.md](./REFERENCES.md) 一起读。**
+
+本模组通过 B 站的非公开接口取流与搜索。这类接口没有公开文档，其调用方式、参数结构与签名机制通常不在服务条款的授权范围内。需要明确的是：
+
+- 本模组**不绕过任何付费或权限控制**：它请求的是用户自己账号权限内的地址，与在浏览器里打开同一个视频是同一回事。
+- 本模组**不提供、不分发任何音频内容**，只是把平台返回的临时地址交给播放器。
+- `SocialSisterYi/bilibili-API-collect`（20,202★）因「系统性收集并向公众传播」B 站接口的认证机制，于 2026-01-28 收到律师函后永久关停。**本仓库不复制它的文档或代码**，但本仓库确实公开了一份 WBI 签名实现 —— 这一点不掩饰。
+- 参照尺度：NeriPlayer（3,561★）与 Folia（3,096★）都在公开仓库里发布了同类实现，本仓库是其中最小的一个。若要评估自身风险，应把它们作为参照。
+
+**使用者自行承担合规责任。** 请在你拥有权利、授权或平台规则允许的范围内使用。
+
+若需要降低暴露面，可选的做法（尚未实施）：把 B 站支持移出公开仓库改为本地构建；或放弃 B 站路径，只保留 LRCLIB、AMLL TTDB、酷狗这些没有这类风险的源。
+
+---
+
 ## 许可证
 
-**AGPL-3.0-only**。音源与歌词源代码移植自 NeriPlayer（GPL-3.0），运行在 Folia（AGPL-3.0）内；GPLv3 §13 允许与 AGPLv3 组合，组合后整体须以 AGPLv3 分发。逐文件对照见 [NOTICE.md](./NOTICE.md)。
+**AGPL-3.0-only**。音源与歌词源代码移植自 NeriPlayer（GPL-3.0），运行在 Folia（AGPL-3.0）内；GPLv3 §13 允许与 AGPLv3 组合，组合后整体须以 AGPLv3 分发。逐文件对照见 [NOTICE.md](./NOTICE.md)，全部上游项目清单见 [REFERENCES.md](./REFERENCES.md)。
 
 > ⚠️ 仓库里**还没有放置 AGPL-3.0 许可全文**。正式分发前请补 `LICENSE`（https://www.gnu.org/licenses/agpl-3.0.txt）。

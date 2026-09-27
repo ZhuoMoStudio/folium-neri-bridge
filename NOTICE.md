@@ -4,6 +4,9 @@
 
 **AGPL-3.0-only**
 
+> 全部相关上游项目（含许可证、类别、风险提示）见 [REFERENCES.md](./REFERENCES.md)。
+> 其中 `SocialSisterYi/bilibili-API-collect` 已因法律原因永久关停，本仓库不再将其列为参考来源。
+
 ## 代码来源
 
 本模组的音源与歌词源实现移植自 **NeriPlayer**，授权 **GPL-3.0**：
@@ -22,7 +25,7 @@ https://github.com/cwuom/NeriPlayer
 | `lib/match.mjs` | `app/src/main/java/moe/ouom/neriplayer/core/api/lyrics/LrcLibClient.kt`（清洗/归一化部分）、`core/api/lyrics/ExternalLyricMatchPolicy.kt`（时长容差） |
 | `providers/bilibili.mjs` | `core/api/bili/BiliClient.kt`（搜索 / 取流）、`core/api/bili/BiliSongResolver.kt` |
 | `providers/lyrics/lrclib.mjs` | `core/api/lyrics/LrcLibClient.kt` |
-| `lib/http.mjs` / `client.mjs` | 新写的 Folium 适配层，不是移植 |
+| `lib/http.mjs` / `client.mjs` / `index.cjs` | 新写的 Folium 适配层，不是移植 |
 
 ## 宿主
 
@@ -39,6 +42,10 @@ NeriPlayer 是 GPL-3.0，Folia 是 AGPL-3.0。GPLv3 §13 允许将 GPLv3 作品�
 ## 第三方资源
 
 目前没有 vendor 任何第三方库（所有依赖都是手写的：MD5、WBI 签名、URL 处理）。若日后为了逐字歌词或 Pixi 渲染引入第三方库，请把它的 ESM 构建放进 `vendor/` 并附上它的许可证文件。
+
+## 第三方接口合规
+
+本模组调用 B 站的非公开接口。相关风险与可选缓解手段见 [REFERENCES.md 的第 7 节](./REFERENCES.md)。
 
 ## 不做的事
 
