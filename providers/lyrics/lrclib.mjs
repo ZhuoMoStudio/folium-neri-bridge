@@ -83,18 +83,8 @@ export const createLrclibBackend = (http) => {
         return payload ? parseEntry(payload) : null;
     };
 
-    /**
-     * 模糊接口：/search?q，再在本地按身份判定筛。
-     *
-     * 关键词只用「标题 + 第一个候选艺术家」：LRCLIB 的 /search 是全文匹配，
-     * 把一堆候选名都塞进去只会引入噪声。身份判定仍然对**全部**候选放行。
-     *
-     * @param relaxedDuration 为 true 时不淘汰时长不符的候选，只把它们排在后面。
-     */
-    const lookupSearch = async ({ title, artists, durationMs, relaxedDuration = false }) => {
-        const keyword = [cleanTrackName(title), primaryArtist(artists[0] ?? '')].filter(Boolean).join(' ').trim();
-        if (!keyword) return null;
-
+    /** 一次 /search 请求 + 本地筛选。 */
+    const searchOnce = async ({ keyword, title, artists, durationMs, relaxedDuration }) => {
         const payload = await http.json(`${BASE_URL}/search?${new URLSearchParams({ q: keyword }).toString()}`, {
             headers: HEADERS,
         });
@@ -123,6 +113,33 @@ export const createLrclibBackend = (http) => {
         return candidates[0];
     };
 
+    /**
+     * 模糊接口：/search?q，再在本地按身份判定筛。
+     *
+     * 关键词先试「标题 + 第一个候选艺术家」，再退到「只按标题」。
+     *
+     * 为什么要退：候选艺术家是从 B 站标题/简介里**猜**的，完全可能是错的
+     * （实测 `['完全不存在的名字', 'YOASOBI']` 这种组合），而把错误猜测写进关键词
+     * 会把整次搜索带偏 —— 原本能命中的歌会一条都搜不出来。
+     * 退到纯标题搜索不会放宽身份要求：本地判定本来就对**全部**候选放行，
+     * 所以这一步只是把搜索结果还给本地筛选，不是把标准降低。
+     *
+     * @param relaxedDuration 为 true 时不淘汰时长不符的候选，只把它们排在后面。
+     */
+    const lookupSearch = async ({ title, artists, durationMs, relaxedDuration = false }) => {
+        const cleaned = cleanTrackName(title);
+        const withArtist = [cleaned, primaryArtist(artists[0] ?? '')].filter(Boolean).join(' ').trim();
+        const keywords = [];
+        if (withArtist) keywords.push(withArtist);
+        if (cleaned && cleaned !== withArtist) keywords.push(cleaned);
+
+        for (const keyword of keywords) {
+            const found = await searchOnce({ keyword, title, artists, durationMs, relaxedDuration });
+            if (found) return found;
+        }
+        return null;
+    };
+
     return {
         /**
          * 找一份能用的歌词。
@@ -139,7 +156,7 @@ export const createLrclibBackend = (http) => {
          * @returns {Promise<{ lrc: string, matched: boolean } | null>}
          *         **只返回带时间戳的歌词**。宿主对 getLyrics 的返回值一律走 parseLRC，
          *        而 parseLRC 会丢弃没有 LRC 时间标签的行（parserCore.ts:347 的
-         *         parseSimpleTimedTextEntry 对无标签行返回 null）。所以把纯文本
+         *        parseSimpleTimedTextEntry 对无标签行返回 null）。所以把纯文本
          *        交出去只会得到一个空歌词列表，不如返回 null 诚实。
          */
         async lookup({ title, artists, artist, durationMs, relaxedDuration = false }) {
