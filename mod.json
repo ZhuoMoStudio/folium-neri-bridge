@@ -2,7 +2,7 @@
   "folium": 1,
   "id": "neri-bridge",
   "name": "NeriPlayer 音源桥",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "ZhuoMoStudio",
   "description": "Bilibili 音源（搜索 / 取流 / 登录）+ AMLL 逐字歌词 + LRCLIB 回退，接进 Folia 的 Folium 模组平台。",
   "main": "index.cjs",

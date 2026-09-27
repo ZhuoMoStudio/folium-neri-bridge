@@ -1,0 +1,3 @@
+node_modules/
+# 真机抓的登录样本（见 test/fixtures/CAPTURE.md）：本地跑，别提交
+test/fixtures/*-local.json
