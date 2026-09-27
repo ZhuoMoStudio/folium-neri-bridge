@@ -1,186 +1,95 @@
 # folium-neri-bridge
 
-把 Android 端 [NeriPlayer](https://github.com/cwuom/NeriPlayer) 的**音源与歌词源**接入 [Folia](https://github.com/chthollyphile/folia-major) 的官方模组平台 **Folium**。
+把 [NeriPlayer](https://github.com/cwuom/NeriPlayer) 的 B 站音源接进 [Folia](https://github.com/chthollyphile/folia-major)。跑在 Folium 模组平台上，**只在桌面版可用**（网页版没有模组系统）。
 
-- 上游议题：[folia-major#440 — omni.providers 透传逐字歌词 wordByWordText](https://github.com/chthollyphile/folia-major/issues/440)
-- 模组 id：`neri-bridge`
-- 上游项目与许可证清单：[REFERENCES.md](./REFERENCES.md)
+上游议题：[chthollyphile/folia-major#440](https://github.com/chthollyphile/folia-major/issues/440)（逐字歌词透传，模组侧暂时拿不到）
 
----
+## 能力
 
-## 为什么需要它
+| 项 | 说明 |
+| --- | --- |
+| 搜索 | B 站视频搜索，WBI 签名 |
+| 播放 | DASH 纯音频流，按档位挑流，带过期时间 |
+| 歌词 | LRCLIB 回退。只返回带时间戳的歌词 |
+| 登录 | 网页窗口 / 扫码 / 粘贴 Cookie 三种，登录态存本机 |
 
-Folia 内建音源是网易云 / 酷狗 / QQ（`src/services/onlineMusic/providerRegistry.ts`）。NeriPlayer 在 Android 端能接的源比这多，本模组就是把差额搬过去。
+未登录也能搜和放，但 B 站会压低音质、会员内容拿不到。
 
-当前状态：
-
-| 来源 | 类型 | 状态 |
-| --- | --- | --- |
-| Bilibili 搜索（WBI 签名） | 音源 | ✅ 已跑通真实 API |
-| Bilibili DASH 取流 | 音源 | ✅ 已跑通真实 API |
-| Bilibili → LRCLIB 歌词回退 | 歌词 | ✅ 已跑通真实 API |
-| AMLL TTML | 逐字歌词 | ⏳ 阻塞于 [#440](https://github.com/chthollyphile/folia-major/issues/440) |
-| 酷狗 krc | 逐字歌词 | ⏳ 同上 |
-| YouTube Music | 音源 + 歌词 | ❌ 移植难度极高（EJS challenge / PoToken / NewPipe 兜底），单独立项 |
-
----
-
-## 验证状态
-
-**测试不是走过场：它们抓到了三个真实缺陷，其中一个是「看起来能跑但会随机失败」的那种。**
-
-```
-npm test           # 01-offline + 03-contract，不联网
-npm run test:live  # 02-live，打真实 B 站与 LRCLIB
-npm run test:cdn   # 04-cdn，采样 CDN 域名并测防盗链策略
-```
-
-最近一次结果（从 GitHub 重新克隆后跑的，Node 22.14.0，2026-09-27）：
-
-| 套件 | 结果 | 覆盖 |
-| --- | --- | --- |
-| `01-offline` | **33 / 33** | MD5 的 RFC 1321 向量、LRC 塌缩时间轴、歌名/艺术家归一化、时长容差边界 |
-| `02-live` | **16 / 16** | 真实 B 站搜索、WBI 缓存、pagelist 取 cid、DASH 取流、CDN 请求头、LRCLIB |
-| `03-contract` | **47 / 47** | 用 **Folia 自己的 `validateManifest`** 校验清单；Referer 判定；打桩宿主端到端跑 `client.mjs` |
-| `04-cdn` | **10 / 10** | 两个 CDN 家族的防盗链策略采样 |
-
-合计 106 项，0 失败。
-
-仍然**没有覆盖**的只剩一件事：模组被 Folia 真正加载后，宿主 UI 里能不能搜到、点开能不能出声。这需要在装有 Folia 的机器上跑一次。
-
----
-
-## 三个被测试抓出来的缺陷
-
-### 1. `view` 接口不可用 → 改用 `pagelist`
-
-`getSong` / `resolveCid` 原本走 `/x/web-interface/wbi/view`，实测对**正确的 bvid 和 aid 都返回 `code: -404`**，而同一个 bvid 在 `/x/player/pagelist` 上能正常拿到 cid。已改为优先 `pagelist`，`view` 只作为补充元数据的次要路径。
-
-### 2. B 站 CDN 的 Referer 是**必需**的，不是可选的
-
-这是最花时间的一个。`<audio>` 无法自定义请求头，所以如果 CDN 要求 Referer，模组无法直接播。
-
-一开始测到「不带 Referer → 206」，据此把 `main` 入口写成了「删掉 Referer」。后来换个节点，同样的请求全部 403。做了受控复现（每变体 3 次、2 轮）之后才看清：**B 站同时用两个 CDN 家族，策略不同。**
-
-| CDN | 不带 Referer | 带 B 站 Referer | 带 localhost Referer |
-| --- | --- | --- | --- |
-| `upos-sz-mirrorcosov.bilivideo.com` | **403** | 206 | 403 |
-| `upos-hz-mirrorakam.akamaized.net` | 206 | 206 | 403 |
-
-而 Folia 的页面来源恰好是两种都不行的情况：开发模式 `http://localhost:3000`（`main.cjs:4205` `loadURL`），生产模式 `file://`（`main.cjs:4209` `loadFile`）。
-
-所以 `index.cjs` 做的是**把 Referer 一律改写成 `https://www.bilibili.com/`**（而不是删掉），这是唯一在两个 CDN 上都稳定通过的配置。
-
-`04-cdn.mjs` 就是为这件事写的：它在一次运行里同时采到两个 CDN，并把策略差异打印出来，避免以后有人再被单次采样误导。
-
-### 3. 纯文本歌词交出去等于没有歌词
-
-`getLyrics` 原本在找不到同步歌词时退回纯文本。但宿主对返回值一律走 `parseLRC`，而 `parseLRC` 会**丢弃所有没有 LRC 时间标签的行**（`parserCore.ts:347` 的 `parseSimpleTimedTextEntry` 对无标签行返回 `null`）。所以交纯文本只会得到一个空歌词列表。现在只在有同步歌词时返回，否则返回 `null`。
-
-顺带发现：B 站是视频源，**MV 时长天然长于录音室版本** —— 实测「夜に駆ける」的 MV 是 276s 而 LRCLIB 记录是 259s，差 17s 已越过 15s 容差上限。所以 Bilibili provider 走 `relaxedDuration`，时长只用于排序，不用于淘汰。
-
----
-
-## 安装
-
-把模组目录放进 Folia 的模组目录（面板右上角「打开模组目录」），或在开发版里放进仓库的 `mods/`：
+## 装
 
 ```bash
-# 在 folia-major 仓库里
+# 在 folia-major 仓库根目录
 git clone https://github.com/ZhuoMoStudio/folium-neri-bridge mods/neri-bridge
-npm install
-npm run dev:electron
+npm install && npm run dev:electron
 ```
 
-然后在「设置 → 实验室 → 模组系统」开启总开关，在模组面板启用本模组并确认。
+设置 → 实验室 → 模组系统 开启总开关，然后在模组面板里启用本模组并确认。
 
-启用后日志里应出现：
+## 测
 
-```
-neri-bridge: registered provider neri-bridge:bilibili
-bilibili referer guard installed
-```
-
----
-
-## 实现要点
-
-### 注册通道不在 `registries` 下
-
-`omni.providers` 是实验接口，挂在 `folium.experimental` 上，且必须在清单里显式选用：
-
-```js
-folium.experimental['omni.providers'].register({ id, displayName, search, getSong, getAudioUrl, getLyrics })
+```bash
+npm test            # 离线：纯函数 + 契约，不联网
+npm run test:live   # 真实 B 站搜索 / 取流 / LRCLIB
+npm run test:cdn    # 采样两个 CDN，验防盗链策略
+npm run test:login  # 扫码登录链路
 ```
 
-`docs/folium/api.md` 生成的 `FoliumRegistries` 列表里**没有** `omniProviders`，照着写会静默失效。
+从干净克隆跑过：54 + 17 + 66 + 17 + 10 = **164 项，0 失败**（Node 22.14，2026-09-27）。
 
-### 一个「拥有歌曲」的音源，而不是纯歌词源
+`03-contract` 不是自己写断言，是加载 folia-major 的 `manifest.cjs` 和打桩宿主，直接跑上游代码。
 
-`src/services/onlineMusic/omni.ts:49` 的 `providerForSong` 按 `song.sourceRef.providerId` 路由，非在线歌曲直接抛 `unsupported`。所以 LRCLIB **不能**作为独立 provider 存在 —— provider 只会在自己的歌被播时被问到，而纯歌词源自己没有歌。它只能活在音源 provider 内部，作为 `getLyrics` 的回退。这个问题已在上游 [议题 #440 的评论](https://github.com/chthollyphile/folia-major/issues/440) 里报给了维护者。
+## 踩过的三个坑
 
-### 为什么 `main` 入口能碰 Electron API
+都写进对应文件的注释了，这里只留结论：
 
-模组的 `main` 入口是用 Node 原生 `require` 加载的（`modSystem.cjs:352`），跑在主进程，有完整 Node 权限，所以 `require('electron')` 拿得到 `session.defaultSession`（Folia 主窗口用的就是它，`main.cjs:2633`）。
+**1. `/x/web-interface/wbi/view` 拿不到 cid。** 对正确的 bvid 和 aid 都返回 `code: -404`，同一个 bvid 在 `/x/player/pagelist` 上正常。已改用 pagelist。
 
-改的是 `session.webRequest.onBeforeSendHeaders`，只动两个请求头，范围限定在 B 站 CDN 域名加 `/upgcxcode/` 路径特征。不会误伤 `folium.net.fetch` —— 后者在主进程用 Node 全局 `fetch` 发请求（`modSystem.cjs:874` 的注释与 `:910` 的调用），不经过 Chromium session。
+**2. B 站有两个 CDN 家族，防盗链策略不一样。**
 
----
+| CDN | 带 B 站 Referer | 不带 |
+| --- | --- | --- |
+| `upos-sz-mirrorcosov.bilivideo.com` | 206 | **403** |
+| `upos-hz-mirrorakam.akamaized.net` | 206 | 206 |
+
+Folia 的页面来源两种都撞 403（开发 `localhost:3000`、生产 `file://`），而 `<audio>` 没法自定义请求头。所以 `index.cjs` 把 Referer 一律改写成 B 站的值。
+
+只测一个节点会得出「不带 Referer 也行」的错误结论 —— 我第一版就是这么写错的。`test/04-cdn.mjs` 专门用来复现这件事。
+
+**3. 纯文本歌词交出去等于没有歌词。** `parseLRC` 会丢无时间标签的行（`parserCore.ts:347`），所以拿不到同步歌词时返回 `null`，不返回纯文本。
+
+## 登录
+
+登录态只在主进程处理，因为 `folium.net.fetch` 拿不到可靠的 `Set-Cookie`：`modSystem.cjs:935` 把响应头归一化成普通对象，undici 会把多个 `Set-Cookie` 用逗号合并，而 cookie 的 `Expires` 自身含逗号。
+
+三种方式：
+
+- **网页窗口**（推荐）— 主进程开一个 BrowserWindow 指向 B 站登录页，轮询 `session.cookies` 直到出现 `SESSDATA`
+- **从应用会话读取** — 如果你已经在别处用 Folia 登录过，直接认过来
+- **粘贴 Cookie** — 从浏览器复制，粘进设置面板
+
+登录后 Cookie 同时注入 CDN 请求（会员内容的流需要它）。
 
 ## 已知限制
 
-### 逐字歌词这条路暂时是堵的
+- **逐字歌词拿不到。** Folium 的 mod provider 能力硬编码在 `omniProviders.ts:62` 的 `wordByWordLyrics: false`，`getLyrics` 只收 `{ lrc, translationLrc }`。等 #440 落地。附带影响：`chorusResolver.ts:54` 读 `wordByWordText` 判副歌，所以模组音源的歌也拿不到副歌识别。
+- **WBI 只有一条密钥路径。** 原实现还有 `GenWebTicket` 兜底，本模组没做。
+- **歌词匹配是简化版。** NeriPlayer 的完整策略是约 480 行评分制（`EditableLyricMatchPolicy.kt`），这里只做了归一化相等 + 艺术家包含。误匹配率会高一些。
+- **B 站歌名的艺术家很弱。** 搜索只给 UP 主名，LRCLIB 的艺术家判定会打折。
+- **还没在真的 Folia 里跑过。** 契约层验过（上游校验器 + 打桩宿主），但 `webRequest` 的实际行为和 `<audio>` 播放要在装了 Folia 的机器上确认。
 
-Folium 的 mod provider 能力硬编码在 `src/mods/folium/registries/omniProviders.ts:62` 的 `wordByWordLyrics: false`，而 `getLyrics` 只返回 `{ lrc, translationLrc }`，宿主一律 `parseLRC`。在 [#440](https://github.com/chthollyphile/folia-major/issues/440) 落地前，本模组只能提供逐行歌词。
+## 上架
 
-附带影响：`chorusResolver.ts:54` 读 `providerResult.wordByWordText` 判副歌，所以模组音源的歌也拿不到副歌识别。
-
-### WBI 签名只有一条密钥获取路径
-
-原实现（NeriPlayer）有两条：优先 `/x/web-interface/nav`，失败则回退 `GenWebTicket`（带 HMAC-SHA256）。本模组只做了第一条。若匿名 `nav` 开始拒绝返回 `wbi_img`，签名会直接失效。
-
-### 歌词匹配是简化版
-
-NeriPlayer 的完整匹配策略在 `EditableLyricMatchPolicy.kt`（约 480 行评分制，能处理《曲名 (Live ver.)》这类版本差异）。本模组只做了归一化后的相等判定加艺术家包含判定，误匹配率会比 Android 端高。
-
-### B 站歌名的艺术家信息很弱
-
-搜索接口只给 UP 主名（例：「Ayase-YOASOBI」），不是真正的曲目艺术家。这会让 LRCLIB 的艺术家判定打折。NeriPlayer 的做法是再用网易云反查一次元数据，本模组还没做。
-
----
-
-## 与上游的关系
-
-本仓库**不是** fork。按 Folium 规范《发布到模组市场》：
-
-> 不需要 fork 任何仓库：你只需要把模组放在自己的公开源码仓库里，再开一个 issue。
-
-若要上架模组市场，在 [folium-compound](https://github.com/chthollyphile/folium-compound) 开「模组提交」issue。上架前还需补：
+不用 fork。按 Folium 规范，模组放自己仓库、去 [folium-compound](https://github.com/chthollyphile/folium-compound) 开 issue 就行。还缺：
 
 - [ ] `preview.png`（1280×720，<1MB）
 - [ ] `LICENSE` 全文
 
----
+## 合规
 
-## 第三方接口的合规说明
+本模组走 B 站非公开接口。不绕过付费内容，不分发音频，只把用户自己账号权限内的地址交给播放器。使用者自行承担合规责任。
 
-**这一节请连同 [REFERENCES.md](./REFERENCES.md) 一起读。**
+注意：`SocialSisterYi/bilibili-API-collect` 已于 2026-01-28 收到律师函后永久关停，指控是「系统性收集并向公众传播非公开 API 的认证机制」。本仓库不复制它的内容，但确实公开了一份 WBI 实现。详见 [REFERENCES.md](./REFERENCES.md)。
 
-本模组通过 B 站的非公开接口取流与搜索。这类接口没有公开文档，其调用方式、参数结构与签名机制通常不在服务条款的授权范围内。需要明确的是：
+## 许可
 
-- 本模组**不绕过任何付费或权限控制**：它请求的是用户自己账号权限内的地址，与在浏览器里打开同一个视频是同一回事。
-- 本模组**不提供、不分发任何音频内容**，只是把平台返回的临时地址交给播放器。
-- `SocialSisterYi/bilibili-API-collect`（20,202★）因「系统性收集并向公众传播」B 站接口的认证机制，于 2026-01-28 收到律师函后永久关停。**本仓库不复制它的文档或代码**，但本仓库确实公开了一份 WBI 签名实现 —— 这一点不掩饰。
-- 参照尺度：NeriPlayer（3,561★）与 Folia（3,096★）都在公开仓库里发布了同类实现，本仓库是其中最小的一个。若要评估自身风险，应把它们作为参照。
-
-**使用者自行承担合规责任。** 请在你拥有权利、授权或平台规则允许的范围内使用。
-
-若需要降低暴露面，可选的做法（尚未实施）：把 B 站支持移出公开仓库改为本地构建；或放弃 B 站路径，只保留 LRCLIB、AMLL TTDB、酷狗这些没有这类风险的源。
-
----
-
-## 许可证
-
-**AGPL-3.0-only**。音源与歌词源代码移植自 NeriPlayer（GPL-3.0），运行在 Folia（AGPL-3.0）内；GPLv3 §13 允许与 AGPLv3 组合，组合后整体须以 AGPLv3 分发。逐文件对照见 [NOTICE.md](./NOTICE.md)，全部上游项目清单见 [REFERENCES.md](./REFERENCES.md)。
-
-> ⚠️ 仓库里**还没有放置 AGPL-3.0 许可全文**。正式分发前请补 `LICENSE`（https://www.gnu.org/licenses/agpl-3.0.txt）。
+AGPL-3.0-only。代码移植自 NeriPlayer（GPL-3.0）、运行在 Folia（AGPL-3.0）内，按 GPLv3 §13 组合后整体取 AGPLv3。逐文件对照见 [NOTICE.md](./NOTICE.md)，上游清单见 [REFERENCES.md](./REFERENCES.md)。
