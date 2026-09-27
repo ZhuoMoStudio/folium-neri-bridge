@@ -165,7 +165,7 @@ Folia 的页面来源两种都撞 403（开发 `localhost:3000`、生产 `file:/
 ## 测
 
 ```bash
-npm test              # 离线：纯函数 + 契约 + 匹配评分 + 逐字歌词 + 自检与登录回归，不联网
+npm test              # 离线：纯函数 + 契约 + 匹配评分 + 逐字歌词 + 自检/登录/分 P 回归，不联网
 npm run test:live     # 真实 B 站搜索 / 多分 P / 取流 / LRCLIB / WBI ticket 兜底 / 匿名音质档位
 npm run test:cdn      # 采样两个 CDN，验防盗链策略
 npm run test:login    # 扫码登录链路的端点形状
@@ -178,7 +178,7 @@ npm run test:all      # 全部
 
 `03-contract` 不是自己写断言，是加载 folia-major 的 `manifest.cjs` 和打桩宿主，直接跑上游代码。
 
-从干净克隆跑过：109 + 107 + 47 + 92 + 110（离线）+ 38 + 10 + 17 + 43 + 30（联网）= **603 项，0 失败**（Node 22.14，2026-09-27）。
+从干净克隆跑过：109 + 107 + 47 + 92 + 133（离线）+ 38 + 10 + 17 + 43 + 30（联网）= **626 项，0 失败**（Node 22.14，2026-09-27）。其中 `04-cdn` 的项数随采样到几个 CDN 家族浮动（6–10，上面写的是采到两个时的数），它本身要断言的就是「不同家族的策略不一致」。
 
 `08-amll-live` 与 `09-youtube` 依赖上游可用性（raw.githubusercontent / amll-ttml-db.stevexmh.net / music.youtube.com），它们红了先看是不是上游的事。
 
