@@ -12,7 +12,7 @@ import { cleanTrackName, isArtistCompatible, isDurationCompatible, isTitleCompat
 
 const BASE_URL = 'https://lrclib.net/api';
 const SEARCH_LIMIT = 10;
-const USER_AGENT = 'NeriBridge/0.1.0 (https://github.com/ZhuoMoStudio/folium-neri-bridge)';
+const USER_AGENT = 'NeriBridge/0.1.1 (https://github.com/ZhuoMoStudio/folium-neri-bridge)';
 
 const HEADERS = { 'User-Agent': USER_AGENT, Accept: 'application/json' };
 
@@ -49,11 +49,6 @@ const parseEntry = (json) => {
  * @param http lib/http.mjs 创建的封装
  */
 export const createLrclibBackend = (http) => {
-    const matches = ({ title, artist, durationMs }, candidate) =>
-        isTitleCompatible(title, candidate.trackName) &&
-        isArtistCompatible(artist, candidate.artistName) &&
-        isDurationCompatible(durationMs, candidate.durationMs);
-
     /** 精确接口：/get?track_name&artist_name&duration */
     const lookupExact = async ({ title, artist, durationSeconds }) => {
         const query = new URLSearchParams({
@@ -65,8 +60,12 @@ export const createLrclibBackend = (http) => {
         return payload ? parseEntry(payload) : null;
     };
 
-    /** 模糊接口：/search?q，再在本地按身份判定筛 */
-    const lookupSearch = async ({ title, artist, durationMs }) => {
+    /**
+     * 模糊接口：/search?q，再在本地按身份判定筛。
+     *
+     * @param relaxedDuration 为 true 时不淘汰时长不符的候选，只把它们排在后面。
+     */
+    const lookupSearch = async ({ title, artist, durationMs, relaxedDuration = false }) => {
         const keyword = [cleanTrackName(title), primaryArtist(artist)].filter(Boolean).join(' ').trim();
         if (!keyword) return null;
 
@@ -75,11 +74,16 @@ export const createLrclibBackend = (http) => {
         });
         if (!Array.isArray(payload)) return null;
 
-        const candidates = payload
+        const identityMatches = payload
             .slice(0, SEARCH_LIMIT)
             .map(parseEntry)
             .filter((entry) => entry !== null)
-            .filter((entry) => matches({ title, artist, durationMs }, entry));
+            .filter((entry) => isTitleCompatible(title, entry.trackName))
+            .filter((entry) => isArtistCompatible(artist, entry.artistName));
+
+        const candidates = relaxedDuration
+            ? identityMatches
+            : identityMatches.filter((entry) => isDurationCompatible(durationMs, entry.durationMs));
         if (candidates.length === 0) return null;
 
         // 有同步歌词的优先，其次时长最接近的
@@ -96,26 +100,43 @@ export const createLrclibBackend = (http) => {
         /**
          * 找一份能用的歌词。
          *
-         * @returns {Promise<{ lrc: string, translationLrc?: string, matched: boolean } | null>}
-         *          lrc 可能是不带时间戳的纯文本（原实现同样允许这种降级）；
-         *          matched 为 true 表示通过了两轮身份校验，为 false 表示是宽泛搜索的兜底结果。
+         * @param {object}  query
+         * @param {string}  query.title           歌名（调用方已清洗）
+         * @param {string}  query.artist          艺术家
+         * @param {number}  query.durationMs      时长
+         * @param {boolean} query.relaxedDuration true 时不把时长当作硬门槛，
+         *        只用它排序。视频源（B 站 MV）的时长天然长于录音室版本 ——
+         *        实测「夜に駆ける」的 MV 是 276s 而 LRCLIB 记录是 259s，差 17s
+         *        已经越过 15s 的容差上限，严格模式下会直接漏掉。
+         * @returns {Promise<{ lrc: string, matched: boolean } | null>}
+         *         **只返回带时间戳的歌词**。宿主对 getLyrics 的返回值一律走 parseLRC，
+         *        而 parseLRC 会丢弃没有 LRC 时间标签的行（parserCore.ts:347 的
+         *         parseSimpleTimedTextEntry 对无标签行返回 null）。所以把纯文本
+         *        交出去只会得到一个空歌词列表，不如返回 null 诚实。
          */
-        async lookup({ title, artist, durationMs }) {
+        async lookup({ title, artist, durationMs, relaxedDuration = false }) {
             if (!title || !Number.isFinite(durationMs) || durationMs <= 0) return null;
             const durationSeconds = Math.round(durationMs / 1000);
 
+            const accept = (candidate, enforceDuration) => {
+                if (!isTitleCompatible(title, candidate.trackName)) return false;
+                if (!isArtistCompatible(artist, candidate.artistName)) return false;
+                return enforceDuration ? isDurationCompatible(durationMs, candidate.durationMs) : true;
+            };
+            const pickSynced = (candidate) =>
+                candidate?.syncedLyrics ? { lrc: candidate.syncedLyrics, matched: true } : null;
+
+            // 1) 精确接口。它按 ID 命中，但仍用本地判定确认一次，挡掉同名不同版本。
             const exact = await lookupExact({ title, artist, durationSeconds });
-            if (exact) {
-                // /get 理论上已经按 ID 命中，再用本地判定确认一次，挡掉同名但版本不同的条目
-                if (matches({ title, artist, durationMs }, exact)) {
-                    return { lrc: exact.syncedLyrics ?? exact.plainLyrics, matched: true };
-                }
+            if (exact && accept(exact, !relaxedDuration)) {
+                const hit = pickSynced(exact);
+                if (hit) return hit;
             }
 
-            const searched = await lookupSearch({ title, artist, durationMs });
-            if (searched) {
-                return { lrc: searched.syncedLyrics ?? searched.plainLyrics, matched: true };
-            }
+            // 2) 搜索接口。内部已按「有同步歌词优先」排序，这里再取一次。
+            const searched = await lookupSearch({ title, artist, durationMs, relaxedDuration });
+            const searchedHit = pickSynced(searched);
+            if (searchedHit) return searchedHit;
 
             return null;
         },
